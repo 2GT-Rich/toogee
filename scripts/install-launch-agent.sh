@@ -20,7 +20,17 @@ plutil -lint "$DEST" >/dev/null
 
 # Replace a running copy, if any, then start it.
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-launchctl bootstrap "$DOMAIN" "$DEST"
+# bootout returns before the old copy is fully gone; bootstrapping too soon
+# fails with "Bad request". Wait for it, then retry a few times.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1 || break
+  sleep 0.5
+done
+for attempt in 1 2 3 4 5; do
+  launchctl bootstrap "$DOMAIN" "$DEST" 2>/dev/null && break
+  [ "$attempt" = 5 ] && { launchctl bootstrap "$DOMAIN" "$DEST"; exit 1; }
+  sleep 1
+done
 launchctl kickstart -k "$DOMAIN/$LABEL"
 
 echo "Installed $DEST"
