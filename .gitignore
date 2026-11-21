@@ -1,0 +1,24 @@
+# secrets and local settings -- copy .env.example to .env
+.env
+.env.*
+!.env.example
+
+# environments, caches, installed packages
+.venv/
+__pycache__/
+*.pyc
+tts/node_modules/
+
+# personal recordings and scratch
+backup/
+*.wav
+
+# firmware build outputs (the toolkit's own .gitignore covers its build/)
+*.uf2
+*.elf
+
+# macOS / editors
+.DS_Store
+*.log
+.vscode/
+.idea/

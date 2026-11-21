@@ -1,0 +1,9 @@
+{
+  "name": "wili-tts",
+  "private": true,
+  "type": "module",
+  "description": "Kokoro text-to-speech helper for the Wili/TooGee assistant",
+  "dependencies": {
+    "kokoro-js": "^1.2.1"
+  }
+}

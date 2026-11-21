@@ -1,0 +1,5 @@
+pyserial
+requests
+numpy
+scipy
+faster-whisper>=1.2

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TooGee launch agent template. scripts/install-launch-agent.sh fills in
+  @REPO@ and @HOME@ and installs it as
+  ~/Library/LaunchAgents/com.toogee.assistant.plist.
+
+  Starts TooGee at login and restarts it if it exits. (If the board is
+  unplugged, TooGee itself waits for it to come back rather than exiting.)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.toogee.assistant</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@REPO@/scripts/run.sh</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@REPO@</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- don't respawn faster than this if it keeps failing (e.g. bad .env) -->
+    <key>ThrottleInterval</key>
+    <integer>15</integer>
+
+    <!-- real-time-ish audio: keep it out of App Nap / background throttling -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>@HOME@/Library/Logs/TooGee/toogee.log</string>
+    <key>StandardErrorPath</key>
+    <string>@HOME@/Library/Logs/TooGee/toogee.log</string>
+</dict>
+</plist>

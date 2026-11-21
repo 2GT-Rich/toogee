@@ -1,0 +1,152 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bfed5d4..b21906b 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -121,6 +121,7 @@ add_subdirectory(apps/lcd)
+ add_subdirectory(apps/bl)
+ 
+ add_subdirectory(apps/template)
++add_subdirectory(apps/wili)
+ add_subdirectory(apps/smoketest)
+ add_subdirectory(apps/bench)
+ add_subdirectory(apps/ogvegas)
+diff --git a/bsp/display_cpu/audio/i2s_audio.c b/bsp/display_cpu/audio/i2s_audio.c
+index dac04a5..7673a44 100644
+--- a/bsp/display_cpu/audio/i2s_audio.c
++++ b/bsp/display_cpu/audio/i2s_audio.c
+@@ -207,8 +207,21 @@ static int16_t *buffer_for(i2s_audio_buffer_t buf) {
+  * s_current_sample by however many input samples were consumed -- the
+  * i2s_audio_fill_count()-sized chunk fillBuffer() computes per call
+  * (rpI2S.cpp:773-776). */
++static i2s_audio_stream_fn s_stream_fill;   /* non-NULL: stream mode */
++
+ static void refill(i2s_audio_buffer_t buf) {
+     int16_t *out = buffer_for(buf);
++    if (s_stream_fill) {
++        unsigned n = s_stream_fill(out, I2S_AUDIO_BUFF_SIZE);
++        if (n > I2S_AUDIO_BUFF_SIZE) n = I2S_AUDIO_BUFF_SIZE;
++        const float mult = i2s_audio_volume_multiplier(s_volume, s_asset_gain);
++        for (unsigned i = 0u; i < n; i++) out[i] = i2s_audio_apply_volume(out[i], mult);
++        for (unsigned i = n; i < I2S_AUDIO_BUFF_SIZE; i++) out[i] = 0;
++        /* Report a full buffer so i2s_audio_chain_drained() never ends the
++           stream: silence is played, not treated as end-of-clip. */
++        s_buf_consumed[(int)buf] = I2S_AUDIO_BUFF_SIZE;
++        return;
++    }
+     const unsigned count = i2s_audio_fill_count(s_total_samples, s_current_sample,
+                                                 I2S_AUDIO_BUFF_SIZE);
+     unsigned consumed;
+@@ -324,6 +337,7 @@ static void stop_internal(void) {
+     s_asset_gain = 1.0f;
+     pio_sm_put(s_pio, s_sm, 0u);
+     s_total_samples = 0;
++    s_stream_fill = NULL;
+     s_playing = false;
+     park_internal();
+ }
+@@ -463,6 +477,21 @@ bool i2s_audio_start(const void *samples, unsigned count, bool force_mono,
+     return true;
+ }
+ 
++bool i2s_audio_start_stream(i2s_audio_stream_fn fill) {
++    if (!s_ready || s_playing || !fill) return false;
++    s_stream_fill = fill;
++    s_src = NULL;
++    s_total_samples = 0;
++    s_current_sample = 0;
++    refill(I2S_AUDIO_BUFFER_A);
++    refill(I2S_AUDIO_BUFFER_B);
++    unpark_internal();
++    configure_dma_chain();
++    s_active = I2S_AUDIO_BUFFER_A;
++    s_playing = true;
++    return true;
++}
++
+ void i2s_audio_process(void) {
+     if (!s_ready || !s_playing) return;
+ 
+diff --git a/bsp/display_cpu/audio/i2s_audio.h b/bsp/display_cpu/audio/i2s_audio.h
+index 4d4fe12..d7a646e 100644
+--- a/bsp/display_cpu/audio/i2s_audio.h
++++ b/bsp/display_cpu/audio/i2s_audio.h
+@@ -764,6 +764,17 @@ bool i2s_audio_is_idle(void);
+  * clamp-and-multiply happens once per fillBuffer() call, not continuously. */
+ void i2s_audio_set_volume(int volume_adjustment);
+ 
++/* ---- Stream mode (added for apps/wili) ----
++ * Instead of a fixed buffer, each ping-pong refill asks `fill` for up to
++ * `capacity` samples (16-bit mono) and returns how many it wrote; the driver
++ * applies the volume and zero-fills the rest. The chain never drains on its
++ * own -- an empty source plays silence -- so the app ends playback with
++ * i2s_audio_stop(), which parks the SM (the only true mute, trap 2).
++ * `fill` runs from i2s_audio_process(), i.e. on the caller's core, never in
++ * an interrupt. Returns false if not initialised or already playing. */
++typedef unsigned (*i2s_audio_stream_fn)(int16_t *out, unsigned capacity);
++bool i2s_audio_start_stream(i2s_audio_stream_fn fill);
++
+ /* Set the per-sound asset gain multiplier -- the
+  * `m_fSingleAssetVolumeAdjustment` role (default 1.0, matching rpI2S.h:69).
+  * An app-layer asset table is the intended caller (see the header's note on
+diff --git a/bsp/display_cpu/lcd/st7789.c b/bsp/display_cpu/lcd/st7789.c
+index 6d58a8d..73343a1 100644
+--- a/bsp/display_cpu/lcd/st7789.c
++++ b/bsp/display_cpu/lcd/st7789.c
+@@ -399,6 +399,43 @@ void st7789_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                           st7789_dma_xfer_count(w, h), true);
+ }
+ 
++/* Added for apps/wili: DMA a w*h buffer of RGB565 pixels (native-endian
++   halfwords, exactly what the CPU writes) into a window, without blocking.
++   Same 16-bit-frame trick as st7789_fill_rect(), but with read increment.
++   The caller must not touch `px` until st7789_busy() is false or
++   st7789_dma_wait() returns -- the next st7789_* call waits for it anyway. */
++void st7789_blit_rect_async(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
++                            const uint16_t *px) {
++    if (!st7789_ready() || !px) return;
++    st7789_dma_wait();
++    uint16_t cw = w, ch = h;
++    if (!st7789_clip_rect(x, y, &cw, &ch)) return;
++    if (cw != w) {          /* rows would be misaligned; only clip height */
++        st7789_set_window(x, y, w, h);
++        st7789_blit(px, (size_t)w * h);
++        return;
++    }
++    st7789_set_window(x, y, w, ch);
++    if (s_dma_ch < 0) {
++        /* No DMA: blocking path with the driver's own byte swap. */
++        st7789_blit(px, (size_t)w * ch);
++        return;
++    }
++    ramwr_begin();
++    spi_set_format(FWOG_LCD_SPI, 16, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
++    dma_channel_config c = dma_channel_get_default_config((uint)s_dma_ch);
++    channel_config_set_transfer_data_size(&c, DMA_SIZE_16);
++    channel_config_set_read_increment(&c, true);
++    channel_config_set_write_increment(&c, false);
++    channel_config_set_dreq(&c, spi_get_dreq(FWOG_LCD_SPI, true));
++    channel_config_set_irq_quiet(&c, true);
++    s_fill_active = true;
++    dma_channel_configure((uint)s_dma_ch, &c,
++                          &spi_get_hw(FWOG_LCD_SPI)->dr,
++                          px,
++                          st7789_dma_xfer_count(w, ch), true);
++}
++
+ void st7789_clear(uint16_t color) {
+     st7789_fill_rect(0u, 0u, ST7789_W, ST7789_H, color);
+ }
+diff --git a/bsp/display_cpu/lcd/st7789.h b/bsp/display_cpu/lcd/st7789.h
+index 735c0d3..257de68 100644
+--- a/bsp/display_cpu/lcd/st7789.h
++++ b/bsp/display_cpu/lcd/st7789.h
+@@ -114,6 +114,9 @@ void st7789_blit(const uint16_t *px, size_t n);
+  * Falls back to a synchronous chunk loop when no DMA channel could be
+  * claimed. Out-of-range and zero-size rects are clipped away by
+  * st7789_clip_rect() and draw nothing. */
++/* Non-blocking DMA blit of w*h native RGB565 pixels (added for apps/wili). */
++void st7789_blit_rect_async(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
++                            const uint16_t *px);
+ void st7789_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+                       uint16_t color);
+ void st7789_clear(uint16_t color);
