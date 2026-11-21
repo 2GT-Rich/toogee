@@ -41,6 +41,7 @@ and a local voice.
 | `wili_board.py` | Host side of the board's USB protocol (mic, speaker, face, buttons, LEDs) |
 | `alarms.py` | Timers and reminders: storage, time parsing, the alarm bell |
 | `weather.py` | Weather from Open-Meteo: place lookup, forecast, wording |
+| `clock.py` | Local time and date questions, answered from the Mac's clock |
 | `tts/` | Kokoro text-to-speech helper (`kokoro_server.mjs`, run by the assistant) |
 | `firmware/apps/wili/` | The board firmware: `display/` (face, audio, protocol) and `main/` |
 | `firmware/patches/` | Small additions to the toolkit's drivers (speaker stream mode, async LCD blit) |
@@ -183,6 +184,13 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
   to 7 days. Set `WILI_LOCATION` for questions without a place; until then it asks
   which city. "Portland" means the biggest one (Oregon); say "Portland, Maine" or
   "Portland ME" for another.
+- **Time and date:** "what time is it?", "what's the time?", "tell me the time",
+  "what's today's date?", "what day is it?", "what's the date and time?", "what
+  year is it?". These are read off the Mac's clock and answered instantly ("It's
+  3:05 PM.", "Today is Saturday, November 21st.") without asking the model, so they
+  work even when the server is down. Anything more ("what time does Costco close?",
+  "what time is it in Tokyo?", "how many days until Christmas?") goes to the model,
+  which is told the current date and time.
 - If the model is slow to answer (a busy server), it says so once ("my brain's a bit
   slow right now") instead of sitting silent.
 

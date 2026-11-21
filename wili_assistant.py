@@ -49,6 +49,7 @@ import requests
 import serial
 
 import alarms
+import clock
 import weather
 import wili_board as wb
 
@@ -940,6 +941,18 @@ class Assistant:
         self.speak(f"Okay, {name} for {alarms.say_duration(secs)}, starting now.")
         return True
 
+    def handle_clock_question(self, text: str) -> bool:
+        """The instant path: "what time is it?" / "what's the date?" are read
+        off this Mac's clock instead of asking the model."""
+        kind = clock.parse_clock_question(text)
+        if not kind:
+            return False
+        answer = clock.answer(kind)
+        print(f"  (clock: {kind})")
+        print(f"{self.cfg.name.lower()}: {answer}")
+        self.speak(answer)
+        return True
+
     def handle_weather_question(self, text: str) -> bool:
         """The instant path: "what's the weather (in X)?" gets a one-sentence
         answer straight from Open-Meteo. Anything about later, or about rain,
@@ -1276,7 +1289,7 @@ class Assistant:
         print(f"you:  {heard}")
         self._said_slow = False
         if (self.handle_volume_command(heard) or self.handle_timer_command(heard)
-                or self.handle_weather_question(heard)):
+                or self.handle_clock_question(heard) or self.handle_weather_question(heard)):
             self.face(wb.IDLE)
             return
         self.face(wb.THINK)
