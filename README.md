@@ -40,6 +40,7 @@ and a local voice.
 | `wili_assistant.py` | The assistant: wake word, listening, Open WebUI, web search, speech |
 | `wili_board.py` | Host side of the board's USB protocol (mic, speaker, face, buttons, LEDs) |
 | `alarms.py` | Timers and reminders: storage, time parsing, the alarm bell |
+| `weather.py` | Weather from Open-Meteo: place lookup, forecast, wording |
 | `tts/` | Kokoro text-to-speech helper (`kokoro_server.mjs`, run by the assistant) |
 | `firmware/apps/wili/` | The board firmware: `display/` (face, audio, protocol) and `main/` |
 | `firmware/patches/` | Small additions to the toolkit's drivers (speaker stream mode, async LCD blit) |
@@ -174,6 +175,16 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
   reminders. They survive restarts; one that came due while TooGee was off is
   announced when it's back ("While I was off, you had a reminder…") if it's under
   six hours old.
+- **Weather:** "what's the weather?", "how's the weather in Portland, Maine?",
+  "will it rain tomorrow?", "do I need a jacket tonight?", "what's the weekend
+  looking like?". Plain "what's the weather (in X)" is answered instantly from
+  [Open-Meteo](https://open-meteo.com) (free, no API key); anything about later or
+  specifics goes to the model's `get_weather` tool, which gets the next hours and up
+  to 7 days. Set `WILI_LOCATION` for questions without a place; until then it asks
+  which city. "Portland" means the biggest one (Oregon); say "Portland, Maine" or
+  "Portland ME" for another.
+- If the model is slow to answer (a busy server), it says so once ("my brain's a bit
+  slow right now") instead of sitting silent.
 
 Other modes: `--no-wake` (buttons only), `--text "question"` (typed, spoken reply),
 `--mac-speaker`, `--wav file.wav` (transcribe), `--check`.
@@ -190,6 +201,8 @@ Other modes: `--no-wake` (buttons only), `--text "question"` (typed, spoken repl
 | `WILI_WAKE_MODEL` | `base.en` | local Whisper model for the wake word |
 | `WILI_VOCAB` | — | comma-separated names speech recognition misspells; used as spelling hints |
 | `WILI_WEB_SEARCH` | `on` | let the model search via Open WebUI |
+| `WILI_LOCATION` | — | home city for weather, e.g. `Portland, Maine` |
+| `WILI_UNITS` | `imperial` | `imperial` (°F, mph) or `metric` |
 | `WILI_TTS` | `kokoro` | `kokoro` or `say` (macOS) |
 | `WILI_KOKORO_VOICE` / `_SPEED` | `af_sky` / `1.1` | any Kokoro voice (`af_heart`, `am_michael`, `bf_emma`, …) |
 | `WILI_SPEAKER` | `board` | `board` or `mac` |
@@ -244,11 +257,13 @@ instructions to answer only from them and say when it couldn't find something.
 Until it hears its name, room audio is only ever processed on the Mac. After a wake,
 the request audio goes to your Open WebUI server for transcription and the text to
 your chosen model; web searches go to your Open WebUI's configured search engine.
+Weather lookups send only the place name (or `WILI_LOCATION`) and its coordinates
+to Open-Meteo.
 The voice is generated locally.
 
 ## Troubleshooting
 
-- **`--check`** tests Open WebUI, speech to text, web search, the board and the voice.
+- **`--check`** tests Open WebUI, speech to text, web search, weather, the board and the voice.
 - **"The Wili board is already in use"** — another copy is running (e.g. the launch
   agent). `scripts/uninstall-launch-agent.sh` or `pkill -f wili_assistant.py`.
 - **It mishears its name** — the log prints what the local model heard for every
@@ -275,3 +290,5 @@ components keep their own licenses (summarised in [NOTICE](NOTICE)):
   Whisper models.
 - [Open WebUI](https://github.com/open-webui/open-webui), and whatever search engine
   it's configured with.
+- Weather data by [Open-Meteo.com](https://open-meteo.com) (CC BY 4.0), free for
+  non-commercial use.

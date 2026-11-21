@@ -49,6 +49,7 @@ import requests
 import serial
 
 import alarms
+import weather
 import wili_board as wb
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -179,6 +180,10 @@ class Config:
         # comma-separated names/terms you use that speech recognition mangles
         # (e.g. a brand spelled unusually); used as spelling hints everywhere
         self.vocab = [v.strip() for v in e("WILI_VOCAB", "").split(",") if v.strip()]
+        # weather: default place for "what's the weather?" (a city, e.g. "Portland, Maine";
+        # unset = TooGee asks which city) and units (imperial = °F/mph, or metric)
+        self.location = e("WILI_LOCATION", "").strip()
+        self.units = e("WILI_UNITS", "imperial").lower()
         self.say_voice = e("WILI_VOICE", "Samantha")
         # "board" = the board's own speaker (default); "mac" = Mac speakers
         self.speaker = e("WILI_SPEAKER", "board").lower()
@@ -214,6 +219,10 @@ class OpenWebUI:
                 r = self.s.post(f"{self.cfg.url}{path}", timeout=(10, read_timeout), **kw)
                 self._last_post = time.time()
                 return r
+            except requests.ReadTimeout as exc:
+                # The server took the request but is slow: retrying would only
+                # pile more work onto it.
+                raise RuntimeError(f"Open WebUI didn't answer within {read_timeout:.0f}s") from exc
             except (requests.ConnectionError, requests.Timeout) as exc:
                 if attempt == 2:
                     raise RuntimeError(f"Open WebUI didn't answer ({type(exc).__name__})") from exc
@@ -247,7 +256,7 @@ class OpenWebUI:
         if tools:
             body["tools"] = tools
         for attempt in (1, 2):
-            r = self._post("/api/chat/completions", read_timeout=30, json=body)
+            r = self._post("/api/chat/completions", read_timeout=90, json=body)
             if r.status_code != 200:
                 raise RuntimeError(f"chat failed: HTTP {r.status_code}: {r.text[:300]}")
             msg = r.json()["choices"][0]["message"]
@@ -784,6 +793,7 @@ class Assistant:
         if cfg.volume == 0:
             print("  (starting muted -- say \"unmute\" to hear me)")
         self.alarms = alarms.Alarms(load_state().get("alarms"), lambda items: save_state(alarms=items))
+        self.weather = weather.Weather(cfg.units, cfg.location)
         for a in self.alarms.pending():
             print(f"  ({'missed while off: ' if a.missed else 'pending: '}{a.describe()})")
 
@@ -862,6 +872,16 @@ class Assistant:
             }},
         }},
     ]
+    WEATHER_TOOL = {"type": "function", "function": {
+        "name": "get_weather",
+        "description": "Current weather and the forecast (next hours and up to 7 days) for a place. "
+                       "Leave out location to use the user's home location.",
+        "parameters": {"type": "object", "properties": {
+            "location": {"type": "string", "description": "city, optionally with state or country, "
+                                                          "e.g. 'Portland, Maine' or 'Paris, France'"},
+            "days": {"type": "integer", "minimum": 1, "maximum": 7, "description": "days of forecast"},
+        }},
+    }}
     MAX_TOOL_ROUNDS = 3
     FILLERS = ["Let me look that up.", "One sec, I'll check.", "Let me find out.", "Good question, let me look."]
 
@@ -918,6 +938,28 @@ class Assistant:
         print(f"  (timer command: {a.describe()})")
         name = f"{label} timer" if label else "timer"
         self.speak(f"Okay, {name} for {alarms.say_duration(secs)}, starting now.")
+        return True
+
+    def handle_weather_question(self, text: str) -> bool:
+        """The instant path: "what's the weather (in X)?" gets a one-sentence
+        answer straight from Open-Meteo. Anything about later, or about rain,
+        jackets and so on, goes to the model with the full forecast."""
+        q = weather.parse_weather_question(text)
+        if not q:
+            return False
+        place = q[1]
+        if not place and not self.cfg.location:
+            return False  # no home location: let the model ask which city
+        self.face(wb.THINK)
+        t = time.time()
+        try:
+            answer = self.weather.summary(place or None)
+        except Exception as exc:
+            print(f"  (weather lookup failed: {exc}; asking the model instead)")
+            return False
+        print(f"  (weather: {place or 'home'} in {time.time() - t:.1f}s)")
+        print(f"{self.cfg.name.lower()}: {answer}")
+        self.speak(answer)
         return True
 
     RING_TRIES = {"timer": 3, "reminder": 2}
@@ -1056,6 +1098,32 @@ class Assistant:
             self.speak(msg)
         return True
 
+    SLOW_NOTICE_SEC = 8.0
+
+    def _chat_with_patience(self, msgs: list[dict], tools) -> dict:
+        """owui.chat(), but if the model is slow to answer, say so once rather
+        than sitting in silence (a busy server once took 89 s for "say hi")."""
+        box: dict = {}
+
+        def call() -> None:
+            try:
+                box["msg"] = self.owui.chat(msgs, tools)
+            except Exception as exc:
+                box["err"] = exc
+
+        th = threading.Thread(target=call, daemon=True)
+        th.start()
+        th.join(self.SLOW_NOTICE_SEC)
+        if th.is_alive() and not getattr(self, "_said_slow", False):
+            self._said_slow = True
+            print("  (the model is slow to answer)")
+            self.speak("Hmm, my brain's a bit slow right now. Hang on.")
+            self.face(wb.THINK)
+        th.join()
+        if "err" in box:
+            raise box["err"]
+        return box["msg"]
+
     def ask(self, text: str) -> str:
         now = time.strftime("%A, %B %-d, %Y, %-I:%M %p %Z")
         system = f"{self.cfg.prompt}\nThe current local date and time is {now}."
@@ -1068,6 +1136,11 @@ class Assistant:
             tools.append(self.VOLUME_TOOL)
             system += (f" Your speaker volume is {self.cfg.volume} out of 10; use set_volume when "
                        "asked to change it.")
+        tools.append(self.WEATHER_TOOL)
+        home = self.cfg.location or "not set"
+        system += (f" For any weather question use get_weather (not web_search); the user's home "
+                   f"location is {home}. Speak temperatures as plain numbers, and answer what they "
+                   "asked (e.g. 'will it rain?') rather than reading out the whole forecast.")
         if self.cfg.web_search:
             tools.append(self.WEB_SEARCH_TOOL)
         tools = tools or None
@@ -1091,7 +1164,7 @@ class Assistant:
 
         said_filler = False
         for _ in range(self.MAX_TOOL_ROUNDS + 1):
-            msg = self.owui.chat(msgs, tools)
+            msg = self._chat_with_patience(msgs, tools)
             calls = msg.get("tool_calls") or []
             if not calls:
                 break
@@ -1119,12 +1192,21 @@ class Assistant:
         # searches start.
         for i, call in enumerate(calls):
             fn = call.get("function") or {}
-            if fn.get("name") not in ("set_volume", "set_timer", "set_reminder", "list_timers", "cancel_timer"):
+            if fn.get("name") not in ("set_volume", "set_timer", "set_reminder", "list_timers", "cancel_timer",
+                                    "get_weather"):
                 continue
             try:
                 args = json.loads(fn.get("arguments") or "{}")
             except ValueError:
                 args = {}
+            if fn.get("name") == "get_weather":
+                t = time.time()
+                try:
+                    results[i] = self.weather.report(args.get("location"), args.get("days") or 3)
+                except Exception as exc:
+                    results[i] = f"The weather lookup failed ({exc}). Tell the user."
+                print(f"  (model get_weather: {json.dumps(args)} in {time.time() - t:.1f}s)")
+                continue
             if fn.get("name") != "set_volume":
                 print(f"  (model {fn.get('name')}: {json.dumps(args)})")
                 results[i] = self.timer_tool(fn["name"], args)
@@ -1192,7 +1274,9 @@ class Assistant:
 
     def respond(self, heard: str) -> None:
         print(f"you:  {heard}")
-        if self.handle_volume_command(heard) or self.handle_timer_command(heard):
+        self._said_slow = False
+        if (self.handle_volume_command(heard) or self.handle_timer_command(heard)
+                or self.handle_weather_question(heard)):
             self.face(wb.IDLE)
             return
         self.face(wb.THINK)
@@ -1393,6 +1477,13 @@ def check(cfg: Config, owui: OpenWebUI) -> None:
             print(f"Web search: OK, {len(sources)} results, {res.count('[from ')} excerpts in {time.time() - t:.1f}s")
         except Exception as exc:
             print(f"Web search: FAILED ({exc})")
+    try:
+        t = time.time()
+        w = weather.Weather(cfg.units, cfg.location)
+        print(f"Weather: OK, {w.summary(cfg.location or 'New York')} ({time.time() - t:.1f}s)"
+              + ("" if cfg.location else "  [WILI_LOCATION not set; used New York]"))
+    except Exception as exc:
+        print(f"Weather: FAILED ({exc})")
     port = wb.find_port()
     print(f"Wili board: {port or 'not found (is the Wili firmware flashed?)'}")
     tts = make_tts(cfg)
