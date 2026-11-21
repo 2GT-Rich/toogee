@@ -154,6 +154,12 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
   giggle.
 - For current questions it says "let me look that up" and searches; the log shows
   which sites each answer came from.
+- **Volume by voice:** "volume up", "volume down", "louder", "a little quieter",
+  "much louder", "volume 6", "max volume", "mute", "unmute". Short, clear commands
+  like these are handled instantly on the Mac; looser ones ("could you be a touch
+  less shouty?") go to the model, which has a `set_volume` tool. It answers at the
+  new volume and shows the level on the LED bar. "Quieter" stops at 1 — only "mute"
+  silences it. The volume you set is remembered across restarts.
 
 Other modes: `--no-wake` (buttons only), `--text "question"` (typed, spoken reply),
 `--mac-speaker`, `--wav file.wav` (transcribe), `--check`.
@@ -173,7 +179,7 @@ Other modes: `--no-wake` (buttons only), `--text "question"` (typed, spoken repl
 | `WILI_TTS` | `kokoro` | `kokoro` or `say` (macOS) |
 | `WILI_KOKORO_VOICE` / `_SPEED` | `af_sky` / `1.1` | any Kokoro voice (`af_heart`, `am_michael`, `bf_emma`, …) |
 | `WILI_SPEAKER` | `board` | `board` or `mac` |
-| `WILI_VOLUME` | `9` | board speaker, 0–10 |
+| `WILI_VOLUME` | `9` | board speaker, 0–10; a volume set by voice is saved in `.toogee_state.json` and wins |
 | `WILI_LED_BRIGHTNESS` | `25` | LED bar, percent |
 | `WILI_SILENCE_SEC` | `1.2` | pause that ends your turn |
 | `WILI_MAX_LISTEN_SEC` | `12` | longest turn |

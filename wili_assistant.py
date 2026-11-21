@@ -56,6 +56,80 @@ RATE = wb.RATE  # 8 kHz, 16-bit mono both ways
 # Whisper tends to "hear" these in silence or noise.
 HALLUCINATIONS = {"", "you", "thank you", "thank you.", "thanks for watching!", "bye.", "."}
 
+# Settings changed by voice (e.g. volume) survive restarts here. Not in git.
+STATE_FILE = HERE / ".toogee_state.json"
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(**changes) -> None:
+    state = load_state()
+    state.update(changes)
+    try:
+        STATE_FILE.write_text(json.dumps(state, indent=1) + "\n")
+    except OSError as exc:
+        print(f"  (couldn't save settings: {exc})")
+
+
+# --------------------------------------------------------------------------- voice commands
+_NUMBERS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten".split())}
+_N = r"(\d{1,2}|zero|one|two|three|four|five|six|seven|eight|nine|ten)"
+_YOU = r"(?:it |yourself |you |the volume |your volume |the sound )?"   # turn ___ up
+# ...but not "turn up the heat" / "turn down the lights"
+_NOT_OTHER = r"(?! (?:the|my|that|this|those|these) (?!volume|sound|speaker)\w)"
+_VOL = r"(?:the |your )?(?:volume|sound)"                                # raise ___
+
+
+def parse_volume_command(text: str) -> tuple[str, int | None] | None:
+    """Recognise short, unambiguous volume requests without asking the model.
+
+    Returns ("up"|"down", steps), ("set", level 0-10), ("mute"|"unmute", None),
+    or None. Only short utterances count, so a question that merely mentions
+    "too loud" goes to the model as a question. Anything looser ("could you be
+    a touch less shouty?") is left to the model's set_volume tool.
+    """
+    t = re.sub(r"[^a-z0-9' ]+", " ", text.lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t or len(t.split()) > 8:
+        return None
+    # "Who sang Louder Than Words?" is a question, not a request
+    if re.match(r"(?:who|what|when|where|why|which|whose)\b", t):
+        return None
+
+    if re.search(r"\bun ?mute\b", t):
+        return ("unmute", None)
+    if re.search(r"^(?:please |okay |ok )?(?:mute|go silent)(?: yourself| the volume| volume| please)*$", t):
+        return ("mute", None)
+    if re.search(r"\b(?:max(?:imum)?|full) volume\b|\bvolume (?:all the way )?(?:up )?to (?:the )?max\b"
+                 r"|\bas loud as (?:you can|possible)\b", t):
+        return ("set", 10)
+    if re.search(r"\b(?:min(?:imum)?|lowest) volume\b|\bas quiet as (?:you can|possible)\b", t):
+        return ("set", 1)
+    m = (re.search(rf"\bvolume (?:to |at |level )?{_N}\b", t)
+         or re.search(rf"\bset (?:the |your )?volume (?:to )?{_N}\b", t))
+    if m:
+        v = m.group(1)
+        return ("set", min(10, int(v) if v.isdigit() else _NUMBERS[v]))
+
+    steps = 2
+    if re.search(r"\b(?:a (?:little )?bit|a little|slightly|a tad|a touch|a smidge)\b", t):
+        steps = 1
+    elif re.search(r"\b(?:a lot|much|way|lots)\b", t):
+        steps = 3
+    if re.search(rf"\b(?:volume up|turn {_YOU}up{_NOT_OTHER}|louder|speak up|raise {_VOL}|increase {_VOL}"
+                 r"|more volume|(?:can't|cannot|can not) hear you)\b", t):
+        return ("up", steps)
+    if re.search(rf"\b(?:volume down|turn {_YOU}down{_NOT_OTHER}|quieter|softer|lower {_VOL}|decrease {_VOL}"
+                 rf"|reduce {_VOL}|less volume|too loud)\b", t):
+        return ("down", steps)
+    return None
+
 
 def default_prompt(name: str) -> str:
     return (
@@ -107,7 +181,12 @@ class Config:
         self.say_voice = e("WILI_VOICE", "Samantha")
         # "board" = the board's own speaker (default); "mac" = Mac speakers
         self.speaker = e("WILI_SPEAKER", "board").lower()
+        # board speaker volume 0-10: WILI_VOLUME is the starting point; a volume
+        # set by voice ("louder", "volume 6") is remembered and wins after that
         self.volume = int(e("WILI_VOLUME", "9"))
+        saved = load_state().get("volume")
+        if isinstance(saved, int) and 0 <= saved <= 10:
+            self.volume = saved
         # LED bar brightness, percent (the full-scale colours are blinding)
         self.led_brightness = float(e("WILI_LED_BRIGHTNESS", "25"))
 
@@ -490,6 +569,33 @@ class Board:
     def chime(self, which: int) -> None:
         self.wb.chime(which)
 
+    def set_volume(self, level: int) -> None:
+        self.wb.volume(level)
+        self.show_level(level)
+
+    _level_timer: threading.Timer | None = None
+
+    def show_level(self, level: int, seconds: float = 2.5) -> None:
+        """Show a 0-10 level on the 7-LED bar (left to right, red when muted),
+        then hand the bar back to the mood colours."""
+        lit = round(level * 7 / 10)
+        if level == 0:
+            colors = [(200, 30, 30)] + [(0, 0, 0)] * 6
+        else:
+            colors = [(40, 200, 190) if i < lit else (0, 6, 6) for i in range(7)]
+        self.wb.leds(colors)
+        if self._level_timer:
+            self._level_timer.cancel()
+
+        def back_to_mood() -> None:
+            try:
+                self.wb.leds(None)
+            except Exception:
+                pass
+        self._level_timer = threading.Timer(seconds, back_to_mood)
+        self._level_timer.daemon = True
+        self._level_timer.start()
+
     # -- input ---------------------------------------------------------------
     def start_stream(self) -> None:
         self.audio = []
@@ -645,6 +751,10 @@ class Assistant:
                  wake: WakeName | None = None) -> None:
         self.cfg, self.board, self.owui, self.tts, self.wake = cfg, board, owui, tts, wake
         self.history: list[dict] = []
+        self._before_mute = int(load_state().get("before_mute", cfg.volume or 7))
+        self._mute_after_reply = False
+        if cfg.volume == 0:
+            print("  (starting muted -- say \"unmute\" to hear me)")
 
     def face(self, mood: int, force: bool = False) -> None:
         if self.board:
@@ -654,7 +764,7 @@ class Assistant:
         if self.board:
             self.board.chime(which)
 
-    TOOLS = [{
+    WEB_SEARCH_TOOL = {
         "type": "function",
         "function": {
             "name": "web_search",
@@ -666,15 +776,106 @@ class Assistant:
                 "required": ["query"],
             },
         },
-    }]
+    }
+    VOLUME_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "set_volume",
+            "description": "Change your own speaker volume (0-10) when the user asks you to be louder, "
+                           "quieter, a particular volume, muted or unmuted.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["up", "down", "set", "mute", "unmute"]},
+                    "level": {"type": "integer", "minimum": 0, "maximum": 10,
+                              "description": "for action=set: the new volume"},
+                    "steps": {"type": "integer", "minimum": 1, "maximum": 5,
+                              "description": "for up/down: 1 = a little, 2 = normal, 3 = a lot"},
+                },
+                "required": ["action"],
+            },
+        },
+    }
     MAX_TOOL_ROUNDS = 3
     FILLERS = ["Let me look that up.", "One sec, I'll check.", "Let me find out.", "Good question, let me look."]
+
+    # -- volume --------------------------------------------------------------
+    def can_set_volume(self) -> bool:
+        return self.board is not None and self.cfg.speaker == "board"
+
+    def change_volume(self, action: str, amount: int | None = None) -> tuple[int, str]:
+        """Apply a volume change. Returns (new level, what to tell the user).
+        Down never goes below 1 -- only an explicit mute silences TooGee."""
+        old = self.cfg.volume
+        if action == "up":
+            new = old + (amount or 2) if old > 0 else max(self._before_mute, 1)
+        elif action == "down":
+            new = max(1, old - (amount or 2)) if old > 0 else 0
+        elif action == "set":
+            new = old if amount is None else amount
+        elif action == "mute":
+            new = 0
+        elif action == "unmute":
+            new = self._before_mute if old == 0 else old
+        else:
+            return old, "I'm not sure how to change the volume like that."
+        new = max(0, min(10, int(new)))
+        if new == 0 and old > 0:
+            self._before_mute = old
+            save_state(before_mute=old)
+
+        if action == "unmute" and old > 0:
+            msg = "I'm not muted."
+        elif new == 0:
+            msg = "Okay, muting. Say unmute when you want to hear me again."
+        elif new == old and action == "up":
+            msg = "I'm already as loud as I go."
+        elif new == old and action == "down":
+            msg = "This is as quiet as I go. Say mute to silence me."
+        elif action == "unmute":
+            msg = f"I'm back, at volume {new}."
+        else:
+            msg = f"Okay, volume {new}."
+        if new != old:
+            self.cfg.volume = new
+            save_state(volume=new)
+            print(f"  (volume {old} -> {new})")
+        return new, msg
+
+    def apply_volume(self) -> None:
+        if self.board:
+            self.board.set_volume(self.cfg.volume)
+
+    def handle_volume_command(self, text: str) -> bool:
+        """The instant path: short, clear volume requests skip the model."""
+        cmd = parse_volume_command(text)
+        if not cmd:
+            return False
+        print(f"  (volume command: {cmd[0]}{'' if cmd[1] is None else ' ' + str(cmd[1])})")
+        if not self.can_set_volume():
+            self.speak("I can only change my own speaker's volume, and I'm using the Mac's speakers.")
+            return True
+        new, msg = self.change_volume(*cmd)
+        if new == 0:
+            self.speak(msg)  # say it while it can still be heard, then mute
+            self.apply_volume()
+        else:
+            self.apply_volume()  # change first, so the reply demonstrates the new level
+            self.speak(msg)
+        return True
 
     def ask(self, text: str) -> str:
         now = time.strftime("%A, %B %-d, %Y, %-I:%M %p %Z")
         system = f"{self.cfg.prompt}\nThe current local date and time is {now}."
-        tools = self.TOOLS if self.cfg.web_search else None
-        if tools:
+        tools = []
+        if self.can_set_volume():
+            tools.append(self.VOLUME_TOOL)
+            system += (f" Your speaker volume is {self.cfg.volume} out of 10; use set_volume when "
+                       "asked to change it.")
+        if self.cfg.web_search:
+            tools.append(self.WEB_SEARCH_TOOL)
+        tools = tools or None
+        if self.cfg.web_search:
             system += (
                 " You can call web_search for anything current or that you aren't sure of. "
                 "When you have searched, your answer must come from the search results only: "
@@ -699,8 +900,9 @@ class Assistant:
             if not calls:
                 break
             msgs.append({"role": "assistant", "content": msg.get("content") or "", "tool_calls": calls})
-            results = self._run_tools(calls, speak_filler=not said_filler)
-            said_filler = True
+            searching = any((c.get("function") or {}).get("name") == "web_search" for c in calls)
+            results = self._run_tools(calls, speak_filler=searching and not said_filler)
+            said_filler = said_filler or searching
             for call, result in zip(calls, results):
                 msgs.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
         else:
@@ -716,6 +918,29 @@ class Assistant:
         """Run the model's tool calls. Searches run in the background while
         TooGee says "let me look that up", since a search takes ~5-10 s."""
         results: list[str] = ["Unknown tool."] * len(calls)
+
+        # Volume changes are instant; do them here, before any searches start.
+        for i, call in enumerate(calls):
+            fn = call.get("function") or {}
+            if fn.get("name") != "set_volume":
+                continue
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except ValueError:
+                args = {}
+            action = str(args.get("action", ""))
+            amount = args.get("level") if action == "set" else args.get("steps")
+            amount = int(amount) if isinstance(amount, (int, float)) else None
+            print(f"  (model set_volume: {action} {amount if amount is not None else ''})")
+            new, msg = self.change_volume(action, amount)
+            if new == 0:
+                # Mute after the reply is spoken, so the user hears the confirmation.
+                self._mute_after_reply = True
+                results[i] = (f"Done: you will be muted (volume 0) as soon as you finish this reply. "
+                              "Tell the user briefly, and that they can say 'unmute'.")
+            else:
+                self.apply_volume()
+                results[i] = f"Done: volume is now {new} out of 10. ({msg}) Confirm it briefly."
 
         def run(i: int, call: dict) -> None:
             fn = call.get("function") or {}
@@ -766,11 +991,17 @@ class Assistant:
 
     def respond(self, heard: str) -> None:
         print(f"you:  {heard}")
+        if self.handle_volume_command(heard):
+            self.face(wb.IDLE)
+            return
         self.face(wb.THINK)
         t = time.time()
         spoken = speakable(self.ask(heard))
         print(f"{self.cfg.name.lower()}: {spoken}   ({time.time() - t:.1f}s)")
         self.speak(spoken)
+        if self._mute_after_reply:
+            self._mute_after_reply = False
+            self.apply_volume()
         self.face(wb.IDLE)
 
     def turn(self, samples: list[int] | None = None, heard: str | None = None,

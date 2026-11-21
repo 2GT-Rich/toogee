@@ -9,6 +9,9 @@ __pycache__/
 *.pyc
 tts/node_modules/
 
+# settings TooGee saves itself (e.g. volume set by voice)
+.toogee_state.json
+
 # personal recordings and scratch
 backup/
 *.wav
