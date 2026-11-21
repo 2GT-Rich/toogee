@@ -251,7 +251,12 @@ noise floor. Each burst goes to a local Whisper model nudged with a prompt and h
 to spell "TooGee" (on real recordings that took it from 3/8 to 7/8 heard correctly,
 with no false wakes); a burst that *starts* with the name wakes it. For "TooGee,
 &lt;request&gt;" the word timestamps cut the name off and only the request goes to Open
-WebUI's (stronger) Whisper.
+WebUI's (stronger) Whisper. In fast speech that cut lands a little off, so the two
+transcripts are reconciled: Open WebUI's mistakes are nearly all in the first word or
+two (a scrap of the name, a clipped "who"), so the local transcript's opening words
+are kept up to where the two agree, and if they don't agree at all the local one wins.
+If you say the name, pause, and start the request before the chime, it skips the chime
+and keeps listening rather than playing over you.
 
 **Web search.** Open WebUI's own `features.web_search` switch only works inside a
 browser chat session, so TooGee offers the model an OpenAI-style `web_search` tool and

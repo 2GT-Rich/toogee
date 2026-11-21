@@ -29,6 +29,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import difflib
 import faulthandler
 import io
 import json
@@ -313,6 +314,55 @@ class OpenWebUI:
 
 
 # --------------------------------------------------------------------------- audio helpers
+def tidy_local(text: str) -> str:
+    """Local Whisper pads a burst's trailing quiet with '. . . .'; drop that."""
+    return re.sub(r"(?:\s*\.){2,}\s*$", ".", re.sub(r"(?:\s+\.){2,}", "", text)).strip()
+
+
+def _tokens(text: str) -> list[str]:
+    return re.findall(r"[A-Za-z0-9']+", text)
+
+
+def _words(text: str) -> list[str]:
+    return [t.lower().replace("'", "") for t in _tokens(text)]
+
+
+def reconcile(remote: str, local: str) -> tuple[str, str]:
+    """Pick the request text for "TooGee, <request>" said in one breath.
+
+    `remote` is Open WebUI's transcript of the audio after the name (a
+    stronger model, and it knows WILI_VOCAB); `local` is what the wake-word
+    model heard after the name, in the whole burst. In fast speech the name
+    runs into the request and the cut (from rough word timings) lands a
+    little off, so Open WebUI's mistakes are nearly all at the start: a scrap
+    of the name ("Gee, what time is it", "Thank you. What time is it?"), a
+    clipped first word ("for the timer for five minutes", "We won the game"
+    for "who won"), and now and then nonsense ("Let's see what I got, guys."
+    for "what's the weather outside?", 2026-11-21). The local transcript,
+    having heard the name too, gets the start right. So: take the local
+    words up to the first place the two agree, Open WebUI's from there on,
+    and if they still don't agree overall, the local transcript.
+    Returns (text, how it was chosen)."""
+    rw, lw = _words(remote), _words(local)
+    if not lw:
+        return remote, "remote"
+    if not rw:
+        return local, "local (remote heard nothing)"
+    first = difflib.SequenceMatcher(None, rw, lw, autojunk=False).get_matching_blocks()[0]
+    k = j = 0  # remote words to drop, local words to put in their place
+    if first.size and first.a <= 2 and first.b <= 3:
+        k, j = first.a, first.b
+    m = re.match(rf"^(?:[^A-Za-z0-9']*[A-Za-z0-9']+){{{k}}}[^A-Za-z0-9']*", remote)
+    tail = remote[m.end():] if k else remote.strip()
+    text = " ".join(_tokens(local)[:j] + [tail]).strip()
+    if difflib.SequenceMatcher(None, _words(text), lw, autojunk=False).ratio() < 0.5:
+        return local, f"local (remote heard {remote!r})"
+    if not (k or j):
+        return remote, "remote"
+    text = text[:1].upper() + text[1:]
+    return text, f"remote {remote!r} with local start"
+
+
 def to_wav(samples: list[int], rate: int = RATE) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -674,8 +724,10 @@ class Board:
             self.audio.extend(block)
             block = self.wb.read_mic(timeout=0)
 
-    def chime_and_capture(self, noise: float | None = None) -> list[int]:
+    def chime_and_capture(self, noise: float | None = None, since: int | None = None) -> list[int]:
         """Chime, then record the request, starting once the chime has died away.
+        `since` (an index into self.audio, where the name ended) lets a request
+        that's already begun be kept whole instead.
 
         The mic hears the chime ~50 ms after it is sent, loud for ~250 ms.
         Marking the send point only works if the queued audio from *before*
@@ -683,41 +735,67 @@ class Board:
         the capture swallows the chime as "speech", and Whisper turns it into
         "Thank you." (seen 2026-11-20)."""
         self.catch_up()
+        if since is not None and self._talking_since(since, noise):
+            # "TooGee ... what time is it" with only a short pause: they
+            # started before the chime. Chiming now would talk over them and
+            # throw that start away, so just keep listening from the name.
+            print("  (already talking; listening without the chime)")
+            return self.capture(noise=noise, begin_at=since)
         sent_at = len(self.audio)
         self.chime(wb.CHIME_LISTEN)
         return self.capture(noise=noise, chime_at=sent_at)
 
+    def _talking_since(self, since: int, noise: float | None) -> bool:
+        """Two or more loud 50 ms blocks in the audio after `since`. Only ~0.3 s
+        has arrived by the time this is asked, so it has to be quick to say yes."""
+        blk = RATE // 20
+        threshold = max(400.0, noise * 3) if noise else 400.0
+        for extra in range(3):  # a word just starting: give it up to 100 ms more
+            levels = [rms(self.audio[i: i + blk]) for i in range(since, len(self.audio) - blk + 1, blk)]
+            loud = sum(v > threshold for v in levels)
+            if loud >= 2 or not levels or levels[-1] <= threshold or extra == 2:
+                return loud >= 2
+            end = time.time() + 0.05
+            while time.time() < end:
+                self.pump(timeout=0.02)
+        return False
+
+    CHIME_SEC = 0.3  # the listen chime is loud for 0.2-0.25 s in the mic, then gone (measured)
+
     def _after_chime(self, sent_at: int, threshold: float) -> int:
         """Index where the chime is over: wait to see it (up to 0.6 s), then
-        until a 50 ms block is back under the speech threshold (up to 1.2 s)."""
+        until a 50 ms block is back under the speech threshold -- or CHIME_SEC
+        after it was first heard, since staying loud past that means someone
+        is already talking over it, and that's the request."""
         half = RATE // 20
-        pos, seen = sent_at, False
+        pos, seen_at = sent_at, None
         limit_seen, limit = sent_at + int(0.6 * RATE), sent_at + int(1.2 * RATE)
         while pos < limit:
             while len(self.audio) < pos + half:
                 self.pump()
             level = rms(self.audio[pos: pos + half])
-            if not seen:
-                seen = level > max(3000.0, threshold * 4)
-                if not seen and pos >= limit_seen:
+            if seen_at is None:
+                if level > max(3000.0, threshold * 4):
+                    seen_at = pos
+                elif pos >= limit_seen:
                     break  # never heard it (muted?); just start
-            elif level <= threshold:
+            elif level <= threshold or pos - seen_at >= int(self.CHIME_SEC * RATE):
                 break
             pos += half
         return max(pos, sent_at + int(0.25 * RATE))
 
     def capture(self, noise: float | None = None, wait_speech_sec: float = 5.0,
-                chime_at: int | None = None) -> list[int]:
+                chime_at: int | None = None, begin_at: int | None = None) -> list[int]:
         """Record from the running stream until the speaker goes quiet.
 
-        Starts at the current end of self.audio, or -- if `chime_at` marks
-        where a chime was sent -- once that chime has died away. With
+        Starts at the current end of self.audio, at `begin_at`, or -- if
+        `chime_at` marks where a chime was sent -- once that chime has died away. With
         noise=None, the first 300 ms is taken as room noise. Returns [] if
         nobody speaks.
         """
         blk = RATE // 10  # 100 ms blocks
         threshold = max(400.0, noise * 3) if noise else 400.0
-        begin = checked = len(self.audio)
+        begin = checked = len(self.audio) if begin_at is None else begin_at
         if chime_at is not None:
             begin = checked = self._after_chime(chime_at, threshold)
         start = time.time()
@@ -1305,8 +1383,9 @@ class Assistant:
     def turn(self, samples: list[int] | None = None, heard: str | None = None,
              fallback: str | None = None) -> None:
         """One exchange. Records push-to-talk style unless samples (or an
-        already-transcribed request) are given. `fallback` is a local
-        transcript to use if Open WebUI's comes back as a silence hallucination."""
+        already-transcribed request) are given. `fallback` is the local
+        transcript of the same request, to check Open WebUI's against (see
+        reconcile)."""
         b = self.board
         assert b
         if heard is None:
@@ -1322,9 +1401,10 @@ class Assistant:
             t = time.time()
             heard = self.owui.transcribe(to_wav(normalize(samples)))
             print(f"  (heard {len(samples) / RATE:.1f}s of audio, transcribed in {time.time() - t:.1f}s)")
-            if fallback and heard.lower().strip() in HALLUCINATIONS:
-                print(f"  (Open WebUI heard {heard!r}; using the local transcript)")
-                heard = fallback
+            if fallback:
+                heard, how = reconcile(heard, fallback)
+                if how != "remote":
+                    print(f"  (using {how})")
         else:
             self.chime(wb.CHIME_DONE)
         if self.wake:
@@ -1395,6 +1475,7 @@ class Assistant:
             request: str | None = None   # "TooGee, <request>" in one breath
             fallback: str | None = None  # local transcript of that request
             due: alarms.Alarm | None = None
+            wake_end: int | None = None  # where a name-only burst ended
             try:
                 while trigger is None:
                     b.pump()
@@ -1428,6 +1509,9 @@ class Assistant:
                                 continue  # a click, not speech
                             t = time.time()
                             text, rest, name_end = wake.find(burst)
+                            # Whisper pads the burst's trailing quiet with ". . . ."
+                            text = tidy_local(text)
+                            rest = None if rest is None else tidy_local(rest)
                             if text:  # wordless noise bursts would just spam the log
                                 print(f"  (heard locally in {time.time() - t:.2f}s: {text!r}"
                                       f"{' -> WAKE' if rest is not None else ''})")
@@ -1440,19 +1524,23 @@ class Assistant:
                                 # it only the audio after the name; fall back
                                 # to the local transcript.
                                 trigger, request = "wake+command", rest
+                                # Word timings are rough, so the cut can leave a
+                                # scrap of the name or clip the first word;
+                                # turn() repairs that with reconcile().
                                 cut = int(((name_end or 0) + 0.05) * RATE)
                                 if name_end and len(burst) - cut > int(0.5 * RATE):
                                     command, request, fallback = burst[cut:], None, rest
                             else:
                                 trigger = "wake"
+                                wake_end = checked
                             break
-                    if checked > RATE * 30 and burst_start is None:
+                    if checked > RATE * 30 and burst_start is None and trigger is None:
                         del b.audio[:checked]  # don't let the idle buffer grow forever
                         checked = 0
                 if trigger in ("wake", "button"):
                     # perk up, chime, and listen for the request
                     self.face(wb.WAKE, force=True)
-                    command = b.chime_and_capture(noise=noise)
+                    command = b.chime_and_capture(noise=noise, since=wake_end)
                 elif trigger == "wake+command":
                     self.face(wb.WAKE, force=True)
             finally:
