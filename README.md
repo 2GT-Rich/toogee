@@ -240,7 +240,7 @@ The voice is generated locally.
 
 TooGee's own code — the assistant, the board protocol, the TTS helper, the scripts
 and `firmware/apps/wili` — is released under the [MIT License](LICENSE). Third-party
-components keep their own licenses:
+components keep their own licenses (summarised in [NOTICE](NOTICE)):
 
 - [wiliOGbsp](https://github.com/freewili/wiliOGbsp) by Free-Wili / Intrepid Control
   Systems — included as a submodule, unmodified except for `firmware/patches/`.
