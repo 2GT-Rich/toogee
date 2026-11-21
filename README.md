@@ -238,11 +238,17 @@ The voice is generated locally.
 
 ## Credits and licenses
 
+TooGee's own code — the assistant, the board protocol, the TTS helper, the scripts
+and `firmware/apps/wili` — is released under the [MIT License](LICENSE). Third-party
+components keep their own licenses:
+
 - [wiliOGbsp](https://github.com/freewili/wiliOGbsp) by Free-Wili / Intrepid Control
   Systems — included as a submodule, unmodified except for `firmware/patches/`.
   Licensed under the **FreeWili Hardware License** (MIT text with a field-of-use
   condition: free for firmware targeting FreeWili hardware; not an open-source
-  license). Firmware built from it is subject to those terms.
+  license). The patches are offered under the same terms as the files they modify,
+  and firmware built from this repository includes that code, so the binaries are
+  subject to those terms.
 - [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) (Apache-2.0) via
   [kokoro-js](https://github.com/hexgrad/kokoro).
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (MIT) and OpenAI's
