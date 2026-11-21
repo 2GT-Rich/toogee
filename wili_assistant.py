@@ -172,6 +172,9 @@ class Config:
         # "name" = listen for WILI_NAME with local Whisper; "off" = buttons only
         self.wake = e("WILI_WAKE", "name").lower()
         self.wake_model = e("WILI_WAKE_MODEL", "base.en")
+        # "TooGee, <request>" in one breath: the request is also transcribed
+        # locally with this (stronger) model; "off" uses the wake model.
+        self.request_model = e("WILI_REQUEST_MODEL", "small.en")
         # text to speech: "kokoro" (default) or "say" (macOS)
         self.tts = e("WILI_TTS", "kokoro").lower()
         # af_sky at 1.1x matches the Kokoro.js voice in your Open WebUI settings
@@ -372,6 +375,23 @@ def reconcile(remote: str, local: str) -> tuple[str, str]:
     return text, f"remote {remote!r} with local start"
 
 
+def pick_request(remote: str, local: str) -> tuple[str, str]:
+    """The request text for "TooGee, <request>" in one breath, from Open
+    WebUI's transcript (`remote`, of the audio after the name) and the local
+    request model's (`local`, of the whole burst). In fast speech the local
+    one is the more reliable (see WakeName.request), so it wins unless Open
+    WebUI's -- after reconcile() has repaired its start -- says nearly the
+    same thing, in which case Open WebUI's spelling (WILI_VOCAB names,
+    numbers) is used. Returns (text, how it was chosen)."""
+    fixed, how = reconcile(remote, local)
+    if how.startswith("local"):
+        return local, how
+    chars = lambda t: re.sub(r"[^a-z0-9]", "", t.lower())
+    if difflib.SequenceMatcher(None, chars(fixed), chars(local), autojunk=False).ratio() >= 0.8:
+        return fixed, how
+    return local, f"local (remote heard {remote!r})"
+
+
 def to_wav(samples: list[int], rate: int = RATE) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
@@ -529,7 +549,7 @@ class WakeName:
     "Toogie", ...). Every burst's local transcript is logged, so new misspellings
     are easy to spot and add."""
 
-    def __init__(self, name: str, model: str) -> None:
+    def __init__(self, name: str, model: str, request_model: str = "off") -> None:
         import numpy as np
         from faster_whisper import WhisperModel
         from scipy.signal import resample_poly
@@ -538,6 +558,25 @@ class WakeName:
         self.name = name
         self.model = WhisperModel(model, device="cpu", compute_type="int8")
         self.pattern = self._pattern(name)
+        # The wake model has to be quick (it hears every burst in the room);
+        # the request model only runs after a wake, so it can be bigger.
+        self.request_model = self.model
+        if request_model.lower() not in ("", "off", "none", model.lower()):
+            print(f"Loading the local request model ({request_model}) ...")
+            self.request_model = WhisperModel(request_model, device="cpu", compute_type="int8")
+
+    def request(self, samples: list[int]) -> str:
+        """What was said after the name, from the whole burst (name included,
+        trailing quiet already trimmed), with the request model.
+
+        Recorded 2026-11-21, fast one-breath requests: Open WebUI, given only
+        the audio after the name, got 5 of 11 right ("attempted." for "what
+        time is it?", "Thank you very much for having me." for "set a timer
+        for five minutes"); small.en on the whole burst, which hears the
+        request in context, got 9 of 11, in ~0.9 s."""
+        text, _ = self._transcribe(samples, model=self.request_model)
+        rest = self.match(text)
+        return tidy_local(text if rest is None else rest)
 
     @staticmethod
     def _pattern(name: str) -> re.Pattern:
@@ -584,7 +623,7 @@ class WakeName:
         return text, text[m.end():].strip(), name_end
 
     def _transcribe(self, samples: list[int], word_times: bool = False,
-                    prompt: str | None = None, hotwords: str | None = None):
+                    prompt: str | None = None, hotwords: str | None = None, model=None):
         np = self.np
         a = np.asarray(samples, dtype=np.float32) / 32768.0
         a16 = self.resample_poly(a, 2, 1).astype(np.float32)
@@ -597,7 +636,7 @@ class WakeName:
         # one 7 s burst took 10 s. max_new_tokens caps runaway "Mm hmm" loops;
         # the name plus a request fits easily.
         n = self.name
-        segs, _ = self.model.transcribe(
+        segs, _ = (model or self.model).transcribe(
             a16, language="en", beam_size=1, temperature=0.0, max_new_tokens=64,
             initial_prompt=prompt or f"Hey {n}! {n}, what time is it? Thanks, {n}.",
             hotwords=hotwords if prompt else n,
@@ -1398,11 +1437,12 @@ class Assistant:
         self.face(wb.IDLE)
 
     def turn(self, samples: list[int] | None = None, heard: str | None = None,
-             fallback: str | None = None) -> None:
+             fallback: str | None = None, whole: list[int] | None = None) -> None:
         """One exchange. Records push-to-talk style unless samples (or an
-        already-transcribed request) are given. `fallback` is the local
-        transcript of the same request, to check Open WebUI's against (see
-        reconcile)."""
+        already-transcribed request) are given. `fallback` is the wake model's
+        transcript of the same request, `whole` the burst it came from (name
+        included): the request model transcribes that alongside Open WebUI,
+        and pick_request() chooses."""
         b = self.board
         assert b
         if heard is None:
@@ -1416,23 +1456,39 @@ class Assistant:
             self.chime(wb.CHIME_DONE)
             self.face(wb.THINK)
             t = time.time()
+            local: dict = {}
+            worker = None
+            if whole and self.wake:
+                worker = threading.Thread(target=self._local_request, args=(whole, local), daemon=True)
+                worker.start()
             try:
                 heard = self.owui.transcribe(to_wav(normalize(samples)))
             except (requests.RequestException, RuntimeError) as exc:
                 if not self.wake:
                     raise
-                # Server unreachable: the local wake-word model can still hear
-                # the request, and time, timers and volume need no server.
+                # Server unreachable: the local models can still hear the
+                # request, and time, timers and volume need no server.
                 print(f"  ({exc}; using the local transcript)")
-                heard = fallback or self.wake.transcribe(samples)
-                fallback = None
-            print(f"  (heard {len(samples) / RATE:.1f}s of audio, transcribed in {time.time() - t:.1f}s)")
-            if fallback:
+                heard = ""
+            if worker:
+                worker.join()
+            if local.get("text"):
+                heard, how = pick_request(heard, local["text"])
+            elif fallback:
                 heard, how = reconcile(heard, fallback)
-                if how != "remote":
-                    print(f"  (using {how})")
+            else:
+                how = "remote"
+                if not heard and self.wake:
+                    heard, how = self.wake.transcribe(samples), "local"
+            print(f"  (heard {len(samples) / RATE:.1f}s of audio, transcribed in {time.time() - t:.1f}s)")
+            if how != "remote":
+                print(f"  (using {how})")
         else:
             self.chime(wb.CHIME_DONE)
+            if whole and self.wake:  # no audio worth sending on: just use the request model
+                local = {}
+                self._local_request(whole, local)
+                heard = local.get("text") or heard
         if self.wake:
             heard = self.wake.strip(heard)
         if heard.lower().strip() in HALLUCINATIONS:
@@ -1441,6 +1497,12 @@ class Assistant:
             self.face(wb.CONFUSED)
             return
         self.respond(heard)
+
+    def _local_request(self, whole: list[int], out: dict) -> None:
+        try:
+            out["text"] = self.wake.request(whole)
+        except Exception as exc:  # the remote transcript still stands
+            print(f"  (local request model failed: {exc})")
 
     def new_conversation(self) -> None:
         self.history.clear()
@@ -1500,6 +1562,7 @@ class Assistant:
             command: list[int] = []
             request: str | None = None   # "TooGee, <request>" in one breath
             fallback: str | None = None  # local transcript of that request
+            whole: list[int] | None = None  # that burst, trailing quiet trimmed
             due: alarms.Alarm | None = None
             wake_end: int | None = None  # where a name-only burst ended
             try:
@@ -1550,6 +1613,10 @@ class Assistant:
                                 # it only the audio after the name; fall back
                                 # to the local transcript.
                                 trigger, request = "wake+command", rest
+                                # Without its trailing quiet: Whisper fills that
+                                # with stray words ("what time is it? Good").
+                                keep = len(burst) - quiet_blocks * blk + int(0.25 * RATE)
+                                whole = burst[:keep] if 0 < keep < len(burst) else burst
                                 # Word timings are rough, so the cut can leave a
                                 # scrap of the name or clip the first word;
                                 # turn() repairs that with reconcile().
@@ -1577,9 +1644,9 @@ class Assistant:
             elif trigger == "white":
                 self.guarded(self.new_conversation)
             elif request is not None:
-                self.guarded(self.turn, None, request)
+                self.guarded(self.turn, None, request, None, whole)
             else:
-                self.guarded(self.turn, command, None, fallback)
+                self.guarded(self.turn, command, None, fallback, whole)
 
 
 def check(cfg: Config, owui: OpenWebUI) -> None:
@@ -1654,7 +1721,7 @@ def main() -> None:
     wake = None
     if not (args.text or args.no_wake or cfg.wake in ("off", "none", "")):
         print(f"Loading the local wake-word model ({cfg.wake_model}) ...")
-        wake = WakeName(cfg.name, cfg.wake_model)
+        wake = WakeName(cfg.name, cfg.wake_model, cfg.request_model)
     board = None
     try:
         if args.text:

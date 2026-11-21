@@ -207,6 +207,7 @@ Other modes: `--no-wake` (buttons only), `--text "question"` (typed, spoken repl
 | `WILI_NAME` | `TooGee` | its name and wake word |
 | `WILI_WAKE` | `name` | `name` or `off` (buttons only) |
 | `WILI_WAKE_MODEL` | `base.en` | local Whisper model for the wake word |
+| `WILI_REQUEST_MODEL` | `small.en` | local Whisper model that also transcribes "TooGee, &lt;request&gt;" said in one breath; `off` to use only Open WebUI's |
 | `WILI_VOCAB` | — | comma-separated names speech recognition misspells; used as spelling hints |
 | `WILI_WEB_SEARCH` | `on` | let the model search via Open WebUI |
 | `WILI_LOCATION` | — | home city for weather, e.g. `Portland, Maine` |
@@ -251,10 +252,13 @@ noise floor. Each burst goes to a local Whisper model nudged with a prompt and h
 to spell "TooGee" (on real recordings that took it from 3/8 to 7/8 heard correctly,
 with no false wakes); a burst that *starts* with the name wakes it. For "TooGee,
 &lt;request&gt;" the word timestamps cut the name off and only the request goes to Open
-WebUI's (stronger) Whisper. In fast speech that cut lands a little off, so the two
-transcripts are reconciled: Open WebUI's mistakes are nearly all in the first word or
-two (a scrap of the name, a clipped "who"), so the local transcript's opening words
-are kept up to where the two agree, and if they don't agree at all the local one wins.
+WebUI's (stronger) Whisper. In fast speech the name runs into the request and that
+cut audio is hard to hear: on recordings of fast one-breath requests, Open WebUI got 5
+of 11 right ("attempted." for "what time is it?"). So the request is also transcribed
+locally by a bigger model (`small.en`, ~0.9 s, at the same time as Open WebUI) from the
+whole burst, trailing quiet trimmed, which got 9 of 11. The local text wins unless Open
+WebUI's says nearly the same thing (after repairing its first word or two), in which
+case Open WebUI's spelling is used.
 If you say the name, pause, and start the request before the chime, it skips the chime
 and keeps listening rather than playing over you.
 

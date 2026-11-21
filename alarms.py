@@ -221,7 +221,9 @@ def parse_timer_command(text: str) -> tuple[int, str] | None:
         words = [w for w in m.group(1).split()
                  if w not in _UNIT and w + "s" not in _UNIT and w.rstrip("s") not in _UNIT
                  and _num(w) is None and w not in {"a", "an", "the", "set", "start", "my", "minute", "second", "hour",
-                                                         "at", "to", "and", "please", "new", "another", "me", "up"}]
+                                                         "at", "to", "and", "please", "new", "another", "me", "up",
+                                                         "that", "this", "is", "we", "you", "can", "could", "would",
+                                                         "will", "go", "make", "put", "ll", "s"} and len(w) > 1]
         label = " ".join(words)
     return int(round(total)), label
 
