@@ -48,6 +48,7 @@ import wave
 import requests
 import serial
 
+import alarms
 import wili_board as wb
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -203,10 +204,16 @@ class OpenWebUI:
     def _post(self, path: str, read_timeout: float, **kw) -> requests.Response:
         """POST with one retry. An idle keep-alive connection (e.g. through a
         proxy/CDN) can die silently and hang until the read timeout; on a
-        timeout or connection error, drop the pooled connections and retry once."""
+        timeout or connection error, drop the pooled connections and retry once.
+        Connections idle for over a minute are dropped up front, which avoids
+        most of those hangs in the first place (a fresh TLS handshake is ~0.1 s)."""
+        if time.time() - getattr(self, "_last_post", 0.0) > 60:
+            self.s.close()
         for attempt in (1, 2):
             try:
-                return self.s.post(f"{self.cfg.url}{path}", timeout=(10, read_timeout), **kw)
+                r = self.s.post(f"{self.cfg.url}{path}", timeout=(10, read_timeout), **kw)
+                self._last_post = time.time()
+                return r
             except (requests.ConnectionError, requests.Timeout) as exc:
                 if attempt == 2:
                     raise RuntimeError(f"Open WebUI didn't answer ({type(exc).__name__})") from exc
@@ -240,7 +247,7 @@ class OpenWebUI:
         if tools:
             body["tools"] = tools
         for attempt in (1, 2):
-            r = self._post("/api/chat/completions", read_timeout=60, json=body)
+            r = self._post("/api/chat/completions", read_timeout=30, json=body)
             if r.status_code != 200:
                 raise RuntimeError(f"chat failed: HTTP {r.status_code}: {r.text[:300]}")
             msg = r.json()["choices"][0]["message"]
@@ -475,8 +482,10 @@ class WakeName:
         # optional "hey"/"hi"/"ok" first; the name must open the utterance
         return re.compile(rf"^\W*(?:(?:hey|hi|hello|ok|okay|yo|oh)\W+)?{core}\b\W*", re.I)
 
-    def transcribe(self, samples: list[int]) -> str:
-        return self._transcribe(samples)[0]
+    def transcribe(self, samples: list[int], prompt: str | None = None, hotwords: str | None = None) -> str:
+        """Plain transcript. `prompt`/`hotwords` override the name hint, e.g. for
+        replies to an alarm ("snooze ...")."""
+        return self._transcribe(samples, prompt=prompt, hotwords=hotwords)[0]
 
     def find(self, samples: list[int]) -> tuple[str, str | None, float | None]:
         """Transcribe a burst; return (text, rest-after-name or None, time in
@@ -505,7 +514,8 @@ class WakeName:
                 break
         return text, text[m.end():].strip(), name_end
 
-    def _transcribe(self, samples: list[int], word_times: bool = False):
+    def _transcribe(self, samples: list[int], word_times: bool = False,
+                    prompt: str | None = None, hotwords: str | None = None):
         np = self.np
         a = np.asarray(samples, dtype=np.float32) / 32768.0
         a16 = self.resample_poly(a, 2, 1).astype(np.float32)
@@ -520,7 +530,8 @@ class WakeName:
         n = self.name
         segs, _ = self.model.transcribe(
             a16, language="en", beam_size=1, temperature=0.0, max_new_tokens=64,
-            initial_prompt=f"Hey {n}! {n}, what time is it? Thanks, {n}.", hotwords=n,
+            initial_prompt=prompt or f"Hey {n}! {n}, what time is it? Thanks, {n}.",
+            hotwords=hotwords if prompt else n,
             vad_filter=False, without_timestamps=not word_times, word_timestamps=word_times,
             condition_on_previous_text=False,
         )
@@ -572,6 +583,23 @@ class Board:
     def set_volume(self, level: int) -> None:
         self.wb.volume(level)
         self.show_level(level)
+
+    def flash_alarm(self, seconds: float = 2.0) -> None:
+        """Flash the LED bar amber, alternating halves, while an alarm rings;
+        then hand it back to the mood colours. Runs in the background."""
+        def run() -> None:
+            amber, off = (255, 140, 0), (0, 0, 0)
+            end = time.time() + seconds
+            flip = False
+            try:
+                while time.time() < end:
+                    self.wb.leds([amber if (i % 2 == 0) != flip else off for i in range(7)])
+                    flip = not flip
+                    time.sleep(0.18)
+                self.wb.leds(None)
+            except Exception:
+                pass
+        threading.Thread(target=run, daemon=True).start()
 
     _level_timer: threading.Timer | None = None
 
@@ -755,6 +783,9 @@ class Assistant:
         self._mute_after_reply = False
         if cfg.volume == 0:
             print("  (starting muted -- say \"unmute\" to hear me)")
+        self.alarms = alarms.Alarms(load_state().get("alarms"), lambda items: save_state(alarms=items))
+        for a in self.alarms.pending():
+            print(f"  ({'missed while off: ' if a.missed else 'pending: '}{a.describe()})")
 
     def face(self, mood: int, force: bool = False) -> None:
         if self.board:
@@ -796,8 +827,169 @@ class Assistant:
             },
         },
     }
+    TIMER_TOOLS = [
+        {"type": "function", "function": {
+            "name": "set_timer",
+            "description": "Start a countdown timer.",
+            "parameters": {"type": "object", "properties": {
+                "seconds": {"type": "integer", "minimum": 1, "description": "length of the timer in seconds"},
+                "label": {"type": "string", "description": "optional short name, e.g. 'pasta'"},
+            }, "required": ["seconds"]},
+        }},
+        {"type": "function", "function": {
+            "name": "set_reminder",
+            "description": "Remind the user of something at a time. Give either `at` (local date and "
+                           "time) or `in_seconds`.",
+            "parameters": {"type": "object", "properties": {
+                "text": {"type": "string", "description": "what to remind them, e.g. 'take the trash out'"},
+                "at": {"type": "string", "description": "local date-time, YYYY-MM-DDTHH:MM"},
+                "in_seconds": {"type": "integer", "minimum": 1},
+            }, "required": ["text"]},
+        }},
+        {"type": "function", "function": {
+            "name": "list_timers",
+            "description": "List the running timers and upcoming reminders, with time left.",
+            "parameters": {"type": "object", "properties": {}},
+        }},
+        {"type": "function", "function": {
+            "name": "cancel_timer",
+            "description": "Cancel timers or reminders. With `match`, those whose name or text "
+                           "contains it; with all=true, every one (optionally only of `kind`).",
+            "parameters": {"type": "object", "properties": {
+                "match": {"type": "string"},
+                "all": {"type": "boolean"},
+                "kind": {"type": "string", "enum": ["timer", "reminder", "any"]},
+            }},
+        }},
+    ]
     MAX_TOOL_ROUNDS = 3
     FILLERS = ["Let me look that up.", "One sec, I'll check.", "Let me find out.", "Good question, let me look."]
+
+    # -- timers and reminders --------------------------------------------------
+    def timer_tool(self, name: str, args: dict) -> str:
+        """Run one timer/reminder tool call; returns the result for the model."""
+        now = time.time()
+        if name == "set_timer":
+            secs = args.get("seconds")
+            if not isinstance(secs, (int, float)) or secs <= 0:
+                return "Error: seconds must be a positive number."
+            a = self.alarms.add_timer(secs, str(args.get("label") or ""))
+            print(f"  (timer set: {a.describe()})")
+            return f"Timer set: {a.describe()}, done at {alarms.say_clock(a.due)}."
+        if name == "set_reminder":
+            text = str(args.get("text") or "").strip()
+            if not text:
+                return "Error: what should the reminder say?"
+            try:
+                if args.get("in_seconds"):
+                    due = now + float(args["in_seconds"])
+                elif args.get("at"):
+                    due = alarms.parse_local_time(str(args["at"]), now)
+                else:
+                    return "Error: give `at` or `in_seconds`."
+            except (ValueError, OverflowError):
+                return f"Error: I couldn't read the time {args.get('at')!r}; use YYYY-MM-DDTHH:MM."
+            a = self.alarms.add_reminder(due, text)
+            print(f"  (reminder set: {a.describe()})")
+            return f"Reminder set: {a.describe()} (in {alarms.say_duration(due - now)})."
+        if name == "list_timers":
+            items = self.alarms.pending()
+            return ("Pending: " + "; ".join(a.describe(now) for a in items) + ".") if items \
+                else "There are no timers or reminders."
+        if name == "cancel_timer":
+            kind = str(args.get("kind") or "any")
+            gone = self.alarms.cancel(str(args.get("match") or ""), bool(args.get("all")),
+                                      "" if kind == "any" else kind)
+            if gone:
+                print(f"  (cancelled: {'; '.join(a.describe(now) for a in gone)})")
+                return "Cancelled: " + "; ".join(a.describe(now) for a in gone) + "."
+            left = self.alarms.pending()
+            return ("Nothing matched. Pending: " + "; ".join(a.describe(now) for a in left) + ".") if left \
+                else "There was nothing to cancel."
+        return "Unknown tool."
+
+    def handle_timer_command(self, text: str) -> bool:
+        """The instant path: 'set a timer for 5 minutes' skips the model."""
+        cmd = alarms.parse_timer_command(text)
+        if not cmd:
+            return False
+        secs, label = cmd
+        a = self.alarms.add_timer(secs, label)
+        print(f"  (timer command: {a.describe()})")
+        name = f"{label} timer" if label else "timer"
+        self.speak(f"Okay, {name} for {alarms.say_duration(secs)}, starting now.")
+        return True
+
+    RING_TRIES = {"timer": 3, "reminder": 2}
+    RING_GAP_SEC = 12.0
+
+    def ring(self, alarm: alarms.Alarm) -> None:
+        """An alarm is due: bell, flash, announce, then listen a few seconds
+        (no wake word needed). Any reply or button press dismisses it;
+        "snooze [N minutes]" re-arms it. Repeats if nobody answers."""
+        b = self.board
+        print(f"  (ALARM: {alarm.announcement()})")
+        bell = alarms.bell_pcm(RATE)
+        tries = self.RING_TRIES.get(alarm.kind, 2)
+        for attempt in range(tries):
+            self.face(wb.WAKE, force=True)
+            if b and self.cfg.speaker == "board":
+                b.flash_alarm(2.0)
+                b.wb.play(bell)
+            elif self.cfg.speaker != "board":
+                subprocess.run(["afplay", self._tmp_wav(bell)], check=False)
+            self.speak(alarm.announcement())
+            if not b:
+                return
+            reply = self._alarm_reply(wait_sec=6.0)
+            if reply is None and attempt < tries - 1:
+                self.face(wb.IDLE)
+                end = time.time() + self.RING_GAP_SEC
+                while time.time() < end and reply is None:
+                    if b.presses():
+                        reply = ("dismiss", 0)
+                    time.sleep(0.1)
+            if reply is None:
+                continue
+            action, secs = reply
+            if action == "snooze":
+                if alarm.kind == "timer":
+                    self.alarms.add_timer(secs, alarm.label, duration=alarm.duration)
+                else:
+                    self.alarms.add_reminder(time.time() + secs, alarm.label)
+                print(f"  (snoozed {alarms.say_duration(secs)})")
+                self.speak(f"Okay, I'll remind you again in {alarms.say_duration(secs)}.")
+                self.face(wb.IDLE)
+            else:
+                print("  (alarm dismissed)")
+                self.face(wb.HAPPY)
+            return
+        print("  (alarm not acknowledged)")
+        self.face(wb.IDLE)
+
+    def _alarm_reply(self, wait_sec: float) -> tuple[str, int] | None:
+        """Listen briefly after an alarm. None if nobody answered."""
+        b = self.board
+        assert b
+        self.face(wb.LISTEN)
+        b.start_stream()
+        b.presses()
+        try:
+            samples = b.capture(wait_speech_sec=wait_sec)
+            pressed = b.presses()
+        finally:
+            b.stop_stream()
+        if pressed:
+            return ("dismiss", 0)
+        if not samples:
+            return None
+        if self.wake:  # local and fast; it only needs "stop" / "snooze ten minutes"
+            text = self.wake.transcribe(samples, prompt="Snooze for five minutes. Okay, thanks. Stop. Snooze.",
+                                        hotwords="snooze")
+        else:
+            text = self.owui.transcribe(to_wav(normalize(samples)))
+        print(f"  (alarm reply: {text!r})")
+        return alarms.parse_alarm_reply(text)
 
     # -- volume --------------------------------------------------------------
     def can_set_volume(self) -> bool:
@@ -867,7 +1059,11 @@ class Assistant:
     def ask(self, text: str) -> str:
         now = time.strftime("%A, %B %-d, %Y, %-I:%M %p %Z")
         system = f"{self.cfg.prompt}\nThe current local date and time is {now}."
-        tools = []
+        tools = list(self.TIMER_TOOLS)
+        system += (f" (In ISO form, now is {time.strftime('%Y-%m-%dT%H:%M')}.) You can set timers and "
+                   "reminders with set_timer and set_reminder, see them with list_timers and remove "
+                   "them with cancel_timer; for reminders at a clock time pass `at` as local "
+                   "YYYY-MM-DDTHH:MM. When you set one, confirm it in a few words.")
         if self.can_set_volume():
             tools.append(self.VOLUME_TOOL)
             system += (f" Your speaker volume is {self.cfg.volume} out of 10; use set_volume when "
@@ -919,15 +1115,20 @@ class Assistant:
         TooGee says "let me look that up", since a search takes ~5-10 s."""
         results: list[str] = ["Unknown tool."] * len(calls)
 
-        # Volume changes are instant; do them here, before any searches start.
+        # Volume, timer and reminder calls are instant; do them here, before any
+        # searches start.
         for i, call in enumerate(calls):
             fn = call.get("function") or {}
-            if fn.get("name") != "set_volume":
+            if fn.get("name") not in ("set_volume", "set_timer", "set_reminder", "list_timers", "cancel_timer"):
                 continue
             try:
                 args = json.loads(fn.get("arguments") or "{}")
             except ValueError:
                 args = {}
+            if fn.get("name") != "set_volume":
+                print(f"  (model {fn.get('name')}: {json.dumps(args)})")
+                results[i] = self.timer_tool(fn["name"], args)
+                continue
             action = str(args.get("action", ""))
             amount = args.get("level") if action == "set" else args.get("steps")
             amount = int(amount) if isinstance(amount, (int, float)) else None
@@ -991,7 +1192,7 @@ class Assistant:
 
     def respond(self, heard: str) -> None:
         print(f"you:  {heard}")
-        if self.handle_volume_command(heard):
+        if self.handle_volume_command(heard) or self.handle_timer_command(heard):
             self.face(wb.IDLE)
             return
         self.face(wb.THINK)
@@ -1061,8 +1262,15 @@ class Assistant:
         print("Ready. Press a button on the board and talk (White = new conversation). Ctrl-C quits.")
         self.face(wb.IDLE)
         while True:
-            button = b.wait_for_button()
-            self.guarded(self.new_conversation if button == "gray" else self.turn)
+            due = self.alarms.due()
+            if due:
+                self.guarded(self.ring, due)
+                continue
+            presses = b.presses()
+            if not presses:
+                time.sleep(0.05)
+                continue
+            self.guarded(self.new_conversation if presses[0] == "gray" else self.turn)
 
     # -- wake word -------------------------------------------------------------
     BURST_ON = 3.5        # x noise floor = speech
@@ -1089,9 +1297,14 @@ class Assistant:
             command: list[int] = []
             request: str | None = None   # "TooGee, <request>" in one breath
             fallback: str | None = None  # local transcript of that request
+            due: alarms.Alarm | None = None
             try:
                 while trigger is None:
                     b.pump()
+                    due = self.alarms.due()
+                    if due:
+                        trigger = "alarm"
+                        break
                     for press in b.presses():
                         trigger = "white" if press == "gray" else "button"
                         print(f"  ({press} button)")
@@ -1148,7 +1361,9 @@ class Assistant:
             finally:
                 # Stop listening while we think and talk, so it can't wake itself up.
                 b.stop_stream()
-            if trigger == "white":
+            if trigger == "alarm":
+                self.guarded(self.ring, due)
+            elif trigger == "white":
                 self.guarded(self.new_conversation)
             elif request is not None:
                 self.guarded(self.turn, None, request)

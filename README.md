@@ -39,6 +39,7 @@ and a local voice.
 | --- | --- |
 | `wili_assistant.py` | The assistant: wake word, listening, Open WebUI, web search, speech |
 | `wili_board.py` | Host side of the board's USB protocol (mic, speaker, face, buttons, LEDs) |
+| `alarms.py` | Timers and reminders: storage, time parsing, the alarm bell |
 | `tts/` | Kokoro text-to-speech helper (`kokoro_server.mjs`, run by the assistant) |
 | `firmware/apps/wili/` | The board firmware: `display/` (face, audio, protocol) and `main/` |
 | `firmware/patches/` | Small additions to the toolkit's drivers (speaker stream mode, async LCD blit) |
@@ -160,6 +161,19 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
   less shouty?") go to the model, which has a `set_volume` tool. It answers at the
   new volume and shows the level on the LED bar. "Quieter" stops at 1 — only "mute"
   silences it. The volume you set is remembered across restarts.
+- **Timers and reminders:** "set a timer for 5 minutes", "ten minute pasta timer",
+  "remind me to take the trash out at 7 pm", "remind me in half an hour to check the
+  laundry", "what timers do I have?", "how long is left?", "cancel the pasta timer".
+  Plain timers are set instantly; everything else goes through the model's
+  `set_timer` / `set_reminder` / `list_timers` / `cancel_timer` tools. When one is
+  due, TooGee interrupts its idle listening: a bell, flashing amber LEDs, and "Your
+  pasta timer is done!" or "Reminder: take the trash out." Then it listens for a few
+  seconds **without needing its name** — say anything ("okay, thanks") or press a
+  button to dismiss, or "snooze for ten minutes" (any duration means snooze). If
+  nobody answers it tries again, up to three times for timers and twice for
+  reminders. They survive restarts; one that came due while TooGee was off is
+  announced when it's back ("While I was off, you had a reminder…") if it's under
+  six hours old.
 
 Other modes: `--no-wake` (buttons only), `--text "question"` (typed, spoken reply),
 `--mac-speaker`, `--wav file.wav` (transcribe), `--check`.
@@ -179,7 +193,7 @@ Other modes: `--no-wake` (buttons only), `--text "question"` (typed, spoken repl
 | `WILI_TTS` | `kokoro` | `kokoro` or `say` (macOS) |
 | `WILI_KOKORO_VOICE` / `_SPEED` | `af_sky` / `1.1` | any Kokoro voice (`af_heart`, `am_michael`, `bf_emma`, …) |
 | `WILI_SPEAKER` | `board` | `board` or `mac` |
-| `WILI_VOLUME` | `9` | board speaker, 0–10; a volume set by voice is saved in `.toogee_state.json` and wins |
+| `WILI_VOLUME` | `9` | board speaker, 0–10; a volume set by voice is saved in `.toogee_state.json` (with your timers and reminders) and wins |
 | `WILI_LED_BRIGHTNESS` | `25` | LED bar, percent |
 | `WILI_SILENCE_SEC` | `1.2` | pause that ends your turn |
 | `WILI_MAX_LISTEN_SEC` | `12` | longest turn |
