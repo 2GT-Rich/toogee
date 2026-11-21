@@ -247,7 +247,7 @@ class OpenWebUI:
             data={"prompt": ", ".join([self.cfg.name, *self.cfg.vocab]) + "."},
         )
         if r.status_code != 200:
-            raise RuntimeError(f"transcription failed: HTTP {r.status_code}: {r.text[:300]}")
+            raise RuntimeError(f"transcription failed: {http_error(r)}")
         return (r.json().get("text") or "").strip()
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
@@ -260,7 +260,7 @@ class OpenWebUI:
         for attempt in (1, 2):
             r = self._post("/api/chat/completions", read_timeout=90, json=body)
             if r.status_code != 200:
-                raise RuntimeError(f"chat failed: HTTP {r.status_code}: {r.text[:300]}")
+                raise RuntimeError(f"chat failed: {http_error(r)}")
             msg = r.json()["choices"][0]["message"]
             msg["content"] = (msg.get("content") or "").strip()
             if msg["content"] or msg.get("tool_calls"):
@@ -283,7 +283,7 @@ class OpenWebUI:
         r = self._post("/api/v1/retrieval/process/web/search", read_timeout=60,
                        json={"queries": [query], "query": query})
         if r.status_code != 200:
-            raise RuntimeError(f"web search failed: HTTP {r.status_code}: {r.text[:200]}")
+            raise RuntimeError(f"web search failed: {http_error(r)}")
         found = r.json()
         items = found.get("items") or []
         lines = [f"Search results for: {query}"]
@@ -314,6 +314,15 @@ class OpenWebUI:
 
 
 # --------------------------------------------------------------------------- audio helpers
+def http_error(r: requests.Response) -> str:
+    """'HTTP 530: Origin DNS error' rather than a page of a proxy's HTML."""
+    body = r.text or ""
+    if "<html" in body[:500].lower():
+        m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+        body = re.sub(r"\s+", " ", m.group(1)).strip() if m else "(an HTML error page)"
+    return f"HTTP {r.status_code}: {body[:200]}"
+
+
 def tidy_local(text: str) -> str:
     """Local Whisper pads a burst's trailing quiet with '. . . .'; drop that."""
     return re.sub(r"(?:\s*\.){2,}\s*$", ".", re.sub(r"(?:\s+\.){2,}", "", text)).strip()
@@ -1372,7 +1381,15 @@ class Assistant:
             return
         self.face(wb.THINK)
         t = time.time()
-        spoken = speakable(self.ask(heard))
+        try:
+            answer = self.ask(heard)
+        except (requests.RequestException, RuntimeError) as exc:
+            print(f"error: {exc}")
+            self.chime(wb.CHIME_ERROR)
+            self.speak("Sorry, I can't reach my brain right now.")
+            self.face(wb.SAD)
+            return
+        spoken = speakable(answer)
         print(f"{self.cfg.name.lower()}: {spoken}   ({time.time() - t:.1f}s)")
         self.speak(spoken)
         if self._mute_after_reply:
@@ -1399,7 +1416,16 @@ class Assistant:
             self.chime(wb.CHIME_DONE)
             self.face(wb.THINK)
             t = time.time()
-            heard = self.owui.transcribe(to_wav(normalize(samples)))
+            try:
+                heard = self.owui.transcribe(to_wav(normalize(samples)))
+            except (requests.RequestException, RuntimeError) as exc:
+                if not self.wake:
+                    raise
+                # Server unreachable: the local wake-word model can still hear
+                # the request, and time, timers and volume need no server.
+                print(f"  ({exc}; using the local transcript)")
+                heard = fallback or self.wake.transcribe(samples)
+                fallback = None
             print(f"  (heard {len(samples) / RATE:.1f}s of audio, transcribed in {time.time() - t:.1f}s)")
             if fallback:
                 heard, how = reconcile(heard, fallback)
