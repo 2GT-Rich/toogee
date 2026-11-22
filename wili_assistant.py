@@ -51,6 +51,7 @@ import serial
 
 import alarms
 import clock
+import status
 import weather
 import wili_board as wb
 
@@ -1079,6 +1080,33 @@ class Assistant:
         self.speak(answer)
         return True
 
+    STATUS_SLOW_SEC = 5.0
+
+    def handle_status_question(self, text: str) -> bool:
+        """The instant path: "are you online?" checks the Open WebUI server and
+        then the language model behind it, and says which part works."""
+        if not status.parse_status_question(text):
+            return False
+        self.face(wb.THINK)
+        server = status.check_server(self.cfg.url)
+        llm = None
+        if server.ok:
+            box: dict = {}
+            th = threading.Thread(target=lambda: box.update(
+                r=status.check_llm(self.cfg.url, self.cfg.key, self.cfg.model)), daemon=True)
+            th.start()
+            th.join(self.STATUS_SLOW_SEC)
+            if th.is_alive():
+                self.speak("I'm connected to the server. Waiting on the language model.")
+                self.face(wb.THINK)
+            th.join()
+            llm = box.get("r")
+        print(f"  (status: {status.log_line(server, llm)})")
+        answer = status.say(server, llm)
+        print(f"{self.cfg.name.lower()}: {answer}")
+        self.speak(answer)
+        return True
+
     def handle_weather_question(self, text: str) -> bool:
         """The instant path: "what's the weather (in X)?" gets a one-sentence
         answer straight from Open-Meteo. Anything about later, or about rain,
@@ -1415,7 +1443,8 @@ class Assistant:
         print(f"you:  {heard}")
         self._said_slow = False
         if (self.handle_volume_command(heard) or self.handle_timer_command(heard)
-                or self.handle_clock_question(heard) or self.handle_weather_question(heard)):
+                or self.handle_clock_question(heard) or self.handle_status_question(heard)
+                or self.handle_weather_question(heard)):
             self.face(wb.IDLE)
             return
         self.face(wb.THINK)
@@ -1659,6 +1688,9 @@ def check(cfg: Config, owui: OpenWebUI) -> None:
         print("OPENWEBUI_MODEL is not set; pick one of the above and put it in .env")
     elif cfg.model not in models:
         print(f"OPENWEBUI_MODEL={cfg.model!r} is not in the list above")
+    if cfg.model:
+        llm = status.check_llm(cfg.url, cfg.key, cfg.model)
+        print(f"Language model: {'OK, answered in %.1fs' % llm.sec if llm.ok else f'FAILED ({llm.why}: {llm.detail})'}")
     try:
         owui.transcribe(to_wav([0] * RATE))
         print("Speech to text: OK")

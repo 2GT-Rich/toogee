@@ -42,6 +42,7 @@ and a local voice.
 | `alarms.py` | Timers and reminders: storage, time parsing, the alarm bell |
 | `weather.py` | Weather from Open-Meteo: place lookup, forecast, wording |
 | `clock.py` | Local time and date questions, answered from the Mac's clock |
+| `status.py` | "Are you online?": checks the Open WebUI server and the language model |
 | `tts/` | Kokoro text-to-speech helper (`kokoro_server.mjs`, run by the assistant) |
 | `firmware/apps/wili/` | The board firmware: `display/` (face, audio, protocol) and `main/` |
 | `firmware/patches/` | Small additions to the toolkit's drivers (speaker stream mode, async LCD blit) |
@@ -191,6 +192,14 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
   work even when the server is down. Anything more ("what time does Costco close?",
   "what time is it in Tokyo?", "how many days until Christmas?") goes to the model,
   which is told the current date and time.
+- **Online check:** "are you online?", "are you connected?", "can you reach the
+  server?", "is the LLM up?", "status check". TooGee checks that Open WebUI answers,
+  then asks the language model for a few words, and says which part works: "Yes, I'm
+  online. I'm connected to the server, and the language model answered in under a
+  second." If something's wrong it says what: no internet, the server (or its
+  Cloudflare tunnel) down, the API key turned down, the model missing, or the model
+  not answering within 30 seconds. It works with the server down, because TooGee's
+  local speech model hears the question.
 - If the model is slow to answer (a busy server), it says so once ("my brain's a bit
   slow right now") instead of sitting silent.
 
@@ -280,7 +289,8 @@ The voice is generated locally.
 
 ## Troubleshooting
 
-- **`--check`** tests Open WebUI, speech to text, web search, weather, the board and the voice.
+- **`--check`** tests Open WebUI, the language model, speech to text, web search, weather, the board and the voice.
+- **Ask it "are you online?"** for a spoken check of the server and the language model.
 - **"The Wili board is already in use"** — another copy is running (e.g. the launch
   agent). `scripts/uninstall-launch-agent.sh` or `pkill -f wili_assistant.py`.
 - **It mishears its name** — the log prints what the local model heard for every
