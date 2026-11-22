@@ -453,14 +453,12 @@ def sentences(text: str, max_len: int = 220) -> list[str]:
 
 
 def asks_question(text: str) -> bool:
-    """Does a reply end by asking the user something? Its last sentence is a
-    question, or a short one follows a question ("Want a timer? Just say so.")."""
+    """Does a reply end by asking the user something? One of its last two
+    sentences is a question ("What's it about? I'm happy to help if ..."),
+    other than a "did you know ...?" lead-in to a fact."""
     parts = [p.strip().rstrip("\"')]”’ ") for p in re.split(r"(?<=[.!?])\s+", speakable(text)) if p.strip()]
-    if not parts:
-        return False
-    if parts[-1].endswith("?"):
-        return True
-    return len(parts) >= 2 and parts[-2].endswith("?") and len(parts[-1].split()) <= 6
+    return any(p.endswith("?") and not re.search(r"(?i)\bdid you know\b", p)
+               for p in parts[-2:])
 
 
 # --------------------------------------------------------------------------- text to speech
