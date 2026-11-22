@@ -25,10 +25,12 @@
 
 wili_face_t g_face;
 
-#define SCR_W 320
-#define SCR_H 240
+/* The screen is 320x240, or 240x320 when the board stands on its side
+   (st7789_set_rotation); s_w x s_h is the current one. */
+#define SCR_MAX 320
 #define BAND_H 16
-#define NBANDS (SCR_H / BAND_H)
+#define NBANDS_MAX (SCR_MAX / BAND_H)
+static int s_w = 320, s_h = 240;
 #define Q 16
 
 /* ---- timing (ms) ---- */
@@ -38,16 +40,20 @@ wili_face_t g_face;
 #define TRANSIENT_MS      4000u   /* happy / confused / sad then back to idle */
 #define GIGGLE_MS         1300u
 #define FRAME_MIN_MS        30u
+#define TURN_MS           650u    /* the face swinging upright after a turn */
+#define DIZZY_MS         1600u    /* then the dizzy face */
 
-/* ---- layout ---- */
-#define EYE_DX   64.0f   /* eye centre offset from screen centre */
-#define EYE_Y   100.0f
-#define MOUTH_Y 182.0f
+/* ---- layout: set by apply_layout() for landscape or portrait ---- */
+static float CX = 160.0f;        /* face centre x */
+static float EYE_DX = 64.0f;     /* eye centre offset from CX */
+static float EYE_Y = 100.0f;
+static float MOUTH_Y = 182.0f;
+static float XTRA_X = 0.0f;      /* shifts the corner extras (thinking dots, ?, Zzz) */
 
 static uint16_t C_BG, C_EYE, C_HI, C_MOUTH, C_TONGUE, C_BLUSH, C_TEAR, C_TEXT,
                 C_DOT, C_EAR;
 
-static uint16_t s_band[2][SCR_W * BAND_H];
+static uint16_t s_band[2][SCR_MAX * BAND_H];
 
 /* =========================================================== primitives */
 
@@ -60,7 +66,8 @@ typedef struct {
     uint8_t  type;
     uint8_t  alpha;            /* 0..255 */
     uint16_t color;
-    int16_t  bx0, by0, bx1, by1;   /* pixel bbox, half-open, already clipped */
+    int16_t  bx0, by0, bx1, by1;   /* pixel bbox on screen, half-open, already clipped */
+    int16_t  fx0, fy0, fx1, fy1;   /* the same in face space, before any turn (see below) */
     int32_t  cx, cy;           /* Q4 */
     int32_t  a, b, c;          /* type-specific, see adders */
 } prim_t;
@@ -77,7 +84,24 @@ static inline float fclampf(float v, float lo, float hi) {
 }
 
 typedef struct { int x0, y0, x1, y1; } clip_t;
-static const clip_t CLIP_SCREEN = {0, 0, SCR_W, SCR_H};
+static clip_t s_clip_screen = {0, 0, 320, 240};
+#define CLIP_SCREEN s_clip_screen
+
+/* While the face swings round after the board is turned, everything is
+   composed in "face space" as usual and drawn rotated by s_ang about the
+   screen centre: screen = C + R(ang)(face - C). s_xf is false the rest of
+   the time, and drawing takes the plain, faster path. */
+static bool  s_xf;
+static float s_cos = 1.0f, s_sin = 0.0f, s_pcx = 160.0f, s_pcy = 120.0f;
+static int32_t s_qcos, s_qsin;   /* Q16, per pixel step */
+
+static void set_turn(float ang) {
+    s_xf = fabsf(ang) > 0.002f;
+    s_cos = cosf(ang); s_sin = sinf(ang);
+    s_pcx = (float)s_w * 0.5f; s_pcy = (float)s_h * 0.5f;
+    s_qcos = (int32_t)lroundf(s_cos * 65536.0f);
+    s_qsin = (int32_t)lroundf(s_sin * 65536.0f);
+}
 
 static prim_t *new_prim(ptype_t t, uint16_t color, float alpha, float bx0,
                         float by0, float bx1, float by1, clip_t clip) {
@@ -87,12 +111,28 @@ static prim_t *new_prim(ptype_t t, uint16_t color, float alpha, float bx0,
     int x0 = imax((int)floorf(bx0) - 1, clip.x0), y0 = imax((int)floorf(by0) - 1, clip.y0);
     int x1 = imin((int)ceilf(bx1) + 1, clip.x1), y1 = imin((int)ceilf(by1) + 1, clip.y1);
     if (x0 >= x1 || y0 >= y1) return NULL;
+    int sx0 = x0, sy0 = y0, sx1 = x1, sy1 = y1;
+    if (s_xf) {   /* the screen box around the turned face box */
+        float lo_x = 1e9f, lo_y = 1e9f, hi_x = -1e9f, hi_y = -1e9f;
+        for (int k = 0; k < 4; k++) {
+            const float fx = (float)((k & 1) ? x1 : x0) - s_pcx;
+            const float fy = (float)((k & 2) ? y1 : y0) - s_pcy;
+            const float X = s_pcx + s_cos * fx - s_sin * fy, Y = s_pcy + s_sin * fx + s_cos * fy;
+            lo_x = fminf(lo_x, X); hi_x = fmaxf(hi_x, X);
+            lo_y = fminf(lo_y, Y); hi_y = fmaxf(hi_y, Y);
+        }
+        sx0 = imax((int)floorf(lo_x) - 1, 0); sy0 = imax((int)floorf(lo_y) - 1, 0);
+        sx1 = imin((int)ceilf(hi_x) + 1, s_w); sy1 = imin((int)ceilf(hi_y) + 1, s_h);
+        if (sx0 >= sx1 || sy0 >= sy1) return NULL;
+    }
     prim_t *p = &s_prims[s_nprims++];
     p->type = (uint8_t)t;
     p->alpha = (uint8_t)a;
     p->color = color;
-    p->bx0 = (int16_t)x0; p->by0 = (int16_t)y0;
-    p->bx1 = (int16_t)x1; p->by1 = (int16_t)y1;
+    p->bx0 = (int16_t)sx0; p->by0 = (int16_t)sy0;
+    p->bx1 = (int16_t)sx1; p->by1 = (int16_t)sy1;
+    p->fx0 = (int16_t)x0; p->fy0 = (int16_t)y0;
+    p->fx1 = (int16_t)x1; p->fy1 = (int16_t)y1;
     return p;
 }
 
@@ -195,7 +235,77 @@ static inline void put(uint16_t *px, uint16_t color, int cov, int alpha) {
     *px = blend565(*px, color, a);
 }
 
+/* Signed distance (Q4) from face-space point (X, Y), also Q4, to primitive p;
+   the same maths as raster() below, one point at a time, for the turned path.
+   Glyphs answer "fully in" (-16) or "out". */
+static int32_t prim_dist(const prim_t *p, int32_t X, int32_t Y) {
+    switch (p->type) {
+    case P_RRECT: {
+        const int32_t hwr = p->a - p->c, hhr = p->b - p->c, r = p->c;
+        const int32_t qx = abs(X - p->cx) - hwr, qy = abs(Y - p->cy) - hhr;
+        if (qx > 0 && qy > 0) return (int32_t)isqrt32((uint32_t)(qx * qx + qy * qy)) - r;
+        return (qx > qy ? qx : qy) - r;
+    }
+    case P_RING: {
+        const int32_t R = p->a, t = p->b, half = p->c;
+        const int32_t dx = X - p->cx, dy = Y - p->cy;
+        const bool out = (half == HALF_UP && dy > 0) || (half == HALF_DOWN && dy < 0) ||
+                         (half == HALF_RIGHT && dx < 0) || (half == HALF_LEFT && dx > 0);
+        if (!out) return abs((int32_t)isqrt32((uint32_t)(dx * dx + dy * dy)) - R) - t;
+        const int32_t along = (half <= HALF_DOWN) ? abs(dx) : abs(dy);
+        const int32_t across = (half <= HALF_DOWN) ? abs(dy) : abs(dx);
+        const int32_t e = along - R;
+        return (int32_t)isqrt32((uint32_t)(e * e + across * across)) - t;
+    }
+    case P_PARA: {
+        const int32_t hw = p->a, curve = p->b, t = p->c;
+        const int32_t ux = X - p->cx;
+        if (abs(ux) > hw) {
+            const int32_t dx = X - (p->cx + (ux < 0 ? -hw : hw)), dy = Y - (p->cy + curve);
+            return (int32_t)isqrt32((uint32_t)(dx * dx + dy * dy)) - t;
+        }
+        const float u = (float)ux / (float)hw;
+        const float slope = 2.0f * (float)curve * u / (float)hw;
+        const int32_t fy = p->cy + (int32_t)((float)curve * u * u);
+        const int32_t k = (int32_t)(256.0f / sqrtf(1.0f + slope * slope));
+        return ((abs(Y - fy) * k) >> 8) - t;
+    }
+    case P_LID: {
+        const int32_t yl = p->cy + (((X - p->cx) * p->a) >> 8);
+        return (p->b > 0) ? (Y - yl) : (yl - Y);
+    }
+    case P_GLYPH: {
+        const int px = X >> 4, py = Y >> 4, sc = p->b;
+        if (px < p->cx || py < p->cy) return 1000;
+        const int col = (px - p->cx) / sc, row = (py - p->cy) / sc;
+        if (col >= (int)LCD_GLYPH_W || row >= (int)LCD_GLYPH_H) return 1000;
+        return (lcd_font_glyph((char)p->a)[col] & (1u << row)) ? -16 : 1000;
+    }
+    default:
+        return 1000;
+    }
+}
+
+static void raster_turned(const prim_t *p, uint16_t *buf, int y0, int y1) {
+    const int ys = imax(p->by0, y0), ye = imin(p->by1, y1);
+    const int xs = p->bx0, xe = p->bx1;
+    const int32_t cx0 = p->fx0 * Q, cy0 = p->fy0 * Q, cx1 = p->fx1 * Q, cy1 = p->fy1 * Q;
+    for (int y = ys; y < ye; y++) {
+        uint16_t *row = buf + (y - y0) * s_w;
+        /* face space of this row's first pixel centre: F = C + R(-ang)(S - C), Q16 */
+        const float dx = (float)xs + 0.5f - s_pcx, dy = (float)y + 0.5f - s_pcy;
+        int32_t fx = (int32_t)lroundf((s_pcx + s_cos * dx + s_sin * dy) * 65536.0f);
+        int32_t fy = (int32_t)lroundf((s_pcy - s_sin * dx + s_cos * dy) * 65536.0f);
+        for (int x = xs; x < xe; x++, fx += s_qcos, fy -= s_qsin) {
+            const int32_t X = fx >> 12, Y = fy >> 12;   /* Q16 -> Q4 */
+            if (X < cx0 || X >= cx1 || Y < cy0 || Y >= cy1) continue;
+            put(&row[x], p->color, cov_of(prim_dist(p, X, Y)), p->alpha);
+        }
+    }
+}
+
 static void raster(const prim_t *p, uint16_t *buf, int y0, int y1) {
+    if (s_xf) { raster_turned(p, buf, y0, y1); return; }
     const int ys = imax(p->by0, y0), ye = imin(p->by1, y1);
     const int xs = p->bx0, xe = p->bx1;
     if (ys >= ye) return;
@@ -204,7 +314,7 @@ static void raster(const prim_t *p, uint16_t *buf, int y0, int y1) {
     case P_RRECT: {
         const int32_t hwr = p->a - p->c, hhr = p->b - p->c, r = p->c;
         for (int y = ys; y < ye; y++) {
-            uint16_t *row = buf + (y - y0) * SCR_W;
+            uint16_t *row = buf + (y - y0) * s_w;
             const int32_t qy = abs(y * Q + 8 - p->cy) - hhr;
             for (int x = xs; x < xe; x++) {
                 const int32_t qx = abs(x * Q + 8 - p->cx) - hwr;
@@ -219,7 +329,7 @@ static void raster(const prim_t *p, uint16_t *buf, int y0, int y1) {
     case P_RING: {
         const int32_t R = p->a, t = p->b, half = p->c;
         for (int y = ys; y < ye; y++) {
-            uint16_t *row = buf + (y - y0) * SCR_W;
+            uint16_t *row = buf + (y - y0) * s_w;
             const int32_t dy = y * Q + 8 - p->cy;
             for (int x = xs; x < xe; x++) {
                 const int32_t dx = x * Q + 8 - p->cx;
@@ -261,7 +371,7 @@ static void raster(const prim_t *p, uint16_t *buf, int y0, int y1) {
                     const int32_t dx = x * Q + 8 - ex, dy = Y - ey;
                     d = (int32_t)isqrt32((uint32_t)(dx * dx + dy * dy)) - t;
                 }
-                put(&buf[(y - y0) * SCR_W + x], p->color, cov_of(d), p->alpha);
+                put(&buf[(y - y0) * s_w + x], p->color, cov_of(d), p->alpha);
             }
         }
         break;
@@ -273,7 +383,7 @@ static void raster(const prim_t *p, uint16_t *buf, int y0, int y1) {
             for (int y = ys; y < ye; y++) {
                 const int32_t Y = y * Q + 8;
                 const int32_t d = (dir > 0) ? (Y - yl) : (yl - Y);
-                put(&buf[(y - y0) * SCR_W + x], p->color, cov_of(d), p->alpha);
+                put(&buf[(y - y0) * s_w + x], p->color, cov_of(d), p->alpha);
             }
         }
         break;
@@ -288,7 +398,7 @@ static void raster(const prim_t *p, uint16_t *buf, int y0, int y1) {
                 const int col = (x - p->cx) / sc;
                 if (col < 0 || col >= (int)LCD_GLYPH_W) continue;
                 if (g[col] & (1u << row))
-                    put(&buf[(y - y0) * SCR_W + x], p->color, 256, p->alpha);
+                    put(&buf[(y - y0) * s_w + x], p->color, 256, p->alpha);
             }
         }
         break;
@@ -296,11 +406,11 @@ static void raster(const prim_t *p, uint16_t *buf, int y0, int y1) {
     }
 }
 
-static bool s_band_was_used[NBANDS];
+static bool s_band_was_used[NBANDS_MAX];
 static int s_cur_buf;
 
 static void draw_frame(bool force_all) {
-    for (int b = 0; b < NBANDS; b++) {
+    for (int b = 0; b < s_h / BAND_H; b++) {
         const int y0 = b * BAND_H, y1 = y0 + BAND_H;
         bool used = false;
         for (int i = 0; i < s_nprims && !used; i++)
@@ -313,10 +423,10 @@ static void draw_frame(bool force_all) {
            the blit that used the other started (blit waits first). */
         const uint32_t fill = ((uint32_t)C_BG << 16) | C_BG;
         uint32_t *w = (uint32_t *)buf;
-        for (int i = 0; i < SCR_W * BAND_H / 2; i++) w[i] = fill;
+        for (int i = 0; i < s_w * BAND_H / 2; i++) w[i] = fill;
         if (used)
             for (int i = 0; i < s_nprims; i++) raster(&s_prims[i], buf, y0, y1);
-        st7789_blit_rect_async(0, (uint16_t)y0, SCR_W, BAND_H, buf);
+        st7789_blit_rect_async(0, (uint16_t)y0, (uint16_t)s_w, BAND_H, buf);
         s_cur_buf ^= 1;
     }
 }
@@ -364,6 +474,11 @@ static float    s_glance_x, s_glance_y;
 static uint32_t s_next_yawn, s_yawn_start;
 static uint32_t s_peek_until;
 static float    s_mouth_env, s_mic_env;
+static uint32_t s_turn_ms;                /* when the last turn started */
+static float    s_turn_from;              /* the face's angle then (rad), easing to 0 */
+static bool     s_turn_funny;             /* whoa while it swings, then dizzy */
+static bool     s_dizzy;                  /* this frame: spiral eyes */
+static uint32_t s_now;
 
 static void enter(wili_mood_t m, uint32_t now) {
     if (m >= WILI_MOOD_COUNT) m = WILI_MOOD_IDLE;
@@ -508,6 +623,27 @@ static void target_pose(uint32_t now, float t) {
         break;
     }
 
+    s_dizzy = false;
+    if (s_turn_funny) {
+        const uint32_t e = now - s_turn_ms;
+        if (e < TURN_MS) {
+            /* whoa: wide eyes and a little "o" while it swings round */
+            n = (pose_t){.ew = 45, .eh = 57, .mw = 9, .mopen = 8, .curve = 0, .gy = -4,
+                         .blush = 0, .glow = 255};
+            wander = false;
+        } else if (e < TURN_MS + DIZZY_MS) {
+            /* dizzy: spiral eyes, a wobbly mouth, the head swaying */
+            s_dizzy = true;
+            n = (pose_t){.ew = 38, .eh = 38, .mw = 18, .curve = 7.0f * sinf(t * 8.0f),
+                         .mx = 6.0f * sinf(t * 3.1f), .gx = 9.0f * sinf(t * 6.5f),
+                         .gy = 3.0f * sinf(t * 4.1f), .bob = 3.0f * sinf(t * 5.0f),
+                         .blush = 0.5f, .glow = 255};
+            wander = false;
+        } else {
+            s_turn_funny = false;
+        }
+    }
+
     if (wander) {
         if (now >= s_next_glance) {
             s_next_glance = now + gap_lo + (rnd() % (gap_hi - gap_lo));
@@ -549,7 +685,7 @@ static void ease_pose(float dt) {
 /* Blink envelope: 1 = open, dips to ~0.05. */
 static float blink_open(uint32_t now) {
     const bool can = s_mood != WILI_MOOD_SLEEP && s_mood != WILI_MOOD_HAPPY &&
-                     s_mood != WILI_MOOD_WAKE;
+                     s_mood != WILI_MOOD_WAKE && !s_turn_funny;
     if (!can) { s_blink_start = 0; return 1.0f; }
     if (!s_blink_start && now >= s_next_blink) {
         s_blink_start = now;
@@ -573,8 +709,28 @@ static float blink_open(uint32_t now) {
 
 /* =========================================================== compose */
 
+/* A spinning spiral, made of half-circles: odd ones centred on (cx, cy),
+   even ones one step aside, each a step bigger, so their ends join up. The
+   four phases turn it a quarter at a time. */
+static void compose_spiral(float cx, float cy, float size) {
+    static const uint8_t ha[4] = {HALF_UP, HALF_RIGHT, HALF_DOWN, HALF_LEFT};
+    static const uint8_t hb[4] = {HALF_DOWN, HALF_LEFT, HALF_UP, HALF_RIGHT};
+    static const int8_t ox[4] = {-1, 0, 1, 0}, oy[4] = {0, -1, 0, 1};
+    const int ph = (int)((s_now / 70u) & 3u);
+    const float d = size / 6.0f;
+    for (int k = 1; k <= 5; k++) {
+        const bool odd = (k & 1) != 0;
+        add_ring(odd ? cx : cx + (float)ox[ph] * d, odd ? cy : cy + (float)oy[ph] * d,
+                 d * (float)k, 5.0f, odd ? ha[ph] : hb[ph], C_EYE, 1.0f, CLIP_SCREEN);
+    }
+}
+
 static void compose_eye(float cx, float cy, float ew, float eh, float open,
                         float sideways /* -1 left eye, +1 right eye */, bool peek) {
+    if (s_dizzy) {
+        compose_spiral(cx, cy, ew);
+        return;
+    }
     const float bob_y = cy;
     const clip_t box = {
         (int)(cx - ew - 4), (int)(bob_y - eh - 6), (int)(cx + ew + 5), (int)(bob_y + eh + 6)
@@ -643,8 +799,9 @@ static void compose_mouth(float cx, float cy, float open) {
 
 static void compose(uint32_t now, float t, float open_blink) {
     s_nprims = 0;
+    s_now = now;
     const float cy = EYE_Y + P.bob + P.gy;
-    const float lx = 160.0f - EYE_DX + P.gx, rx = 160.0f + EYE_DX + P.gx;
+    const float lx = CX - EYE_DX + P.gx, rx = CX + EYE_DX + P.gx;
 
     float lw = P.ew, lh = P.eh, rw = P.ew, rh = P.eh;
     if (P.lopsided > 0.01f) {
@@ -658,14 +815,14 @@ static void compose(uint32_t now, float t, float open_blink) {
     /* blush */
     if (P.blush > 0.03f) {
         const float by = EYE_Y + P.bob + P.eh + 16.0f;
-        add_rrect(160.0f - EYE_DX - 14.0f, by, 18, 8, 8, C_BLUSH, P.blush * 0.55f, CLIP_SCREEN);
-        add_rrect(160.0f + EYE_DX + 14.0f, by, 18, 8, 8, C_BLUSH, P.blush * 0.55f, CLIP_SCREEN);
+        add_rrect(CX - EYE_DX - 14.0f, by, 18, 8, 8, C_BLUSH, P.blush * 0.55f, CLIP_SCREEN);
+        add_rrect(CX + EYE_DX + 14.0f, by, 18, 8, 8, C_BLUSH, P.blush * 0.55f, CLIP_SCREEN);
     }
 
     /* mouth: baseline opening plus lip sync */
     float open = P.mopen;
     if (s_mood == WILI_MOOD_TALK) open += 2.0f + s_mouth_env * 20.0f;
-    compose_mouth(160.0f + P.mx + P.gx * 0.25f, MOUTH_Y + P.bob * 0.8f + P.gy * 0.2f, open);
+    compose_mouth(CX + P.mx + P.gx * 0.25f, MOUTH_Y + P.bob * 0.8f + P.gy * 0.2f, open);
 
     /* --- extras --- */
     if (s_mood == WILI_MOOD_LISTEN) {
@@ -684,10 +841,10 @@ static void compose(uint32_t now, float t, float open_blink) {
         for (int i = 0; i < 3; i++) {
             const float ph = t * 7.0f - (float)i * 1.1f;
             const float up = fmaxf(0.0f, sinf(ph)) * 7.0f;
-            add_circle(236.0f + 17.0f * (float)i, 34.0f - up, 5.5f, C_DOT, 1.0f, CLIP_SCREEN);
+            add_circle(XTRA_X + 236.0f + 17.0f * (float)i, 34.0f - up, 5.5f, C_DOT, 1.0f, CLIP_SCREEN);
         }
     } else if (s_mood == WILI_MOOD_CONFUSED) {
-        add_glyph('?', 246.0f, 12.0f + 3.0f * sinf(t * 3.0f), 5, C_TEXT, 1.0f);
+        add_glyph('?', XTRA_X + 246.0f, 12.0f + 3.0f * sinf(t * 3.0f), 5, C_TEXT, 1.0f);
     } else if (s_mood == WILI_MOOD_SAD) {
         const float ph = fmodf(t * 0.45f, 1.0f);
         const float ty = EYE_Y + P.eh + 4.0f + ph * 46.0f;
@@ -696,13 +853,41 @@ static void compose(uint32_t now, float t, float open_blink) {
     } else if (s_mood == WILI_MOOD_SLEEP) {
         for (int i = 0; i < 3; i++) {
             const float ph = fmodf(t * 0.33f + (float)i / 3.0f, 1.0f);
-            const float x = 232.0f + ph * 46.0f + 5.0f * sinf(ph * 9.0f);
+            const float x = XTRA_X + 232.0f + ph * 46.0f + 5.0f * sinf(ph * 9.0f);
             const float y = 74.0f - ph * 66.0f;
             const int sc = 2 + (int)(ph * 3.0f);
             const float a = ph < 0.2f ? ph / 0.2f : (ph > 0.7f ? (1.0f - ph) / 0.3f : 1.0f);
             add_glyph(i == 1 ? 'Z' : 'z', x, y, sc, C_TEXT, a);
         }
     }
+}
+
+/* =========================================================== rotation */
+
+/* The face's angle now: s_turn_from easing to 0 with a little overshoot, so
+   it swings past upright and settles back like it's on a spring. */
+static float turn_angle(uint32_t now) {
+    const uint32_t e = now - s_turn_ms;
+    if (s_turn_from == 0.0f || e >= TURN_MS) return 0.0f;
+    const float u = (float)e / (float)TURN_MS - 1.0f;            /* -1..0 */
+    const float back = 1.0f + 2.70158f * u * u * u + 1.70158f * u * u;   /* ease-out-back */
+    return s_turn_from * (1.0f - back);
+}
+
+/* Landscape keeps the original layout. Portrait (240 wide, 320 tall) brings
+   the eyes closer and centres the face lower; the corner extras move in to
+   stay on screen. */
+static void apply_layout(void) {
+    s_w = st7789_width();
+    s_h = st7789_height();
+    s_clip_screen = (clip_t){0, 0, s_w, s_h};
+    CX = (float)s_w * 0.5f;
+    if (s_w >= s_h) {
+        EYE_DX = 64.0f; EYE_Y = 100.0f; MOUTH_Y = 182.0f; XTRA_X = 0.0f;
+    } else {
+        EYE_DX = 52.0f; EYE_Y = 140.0f; MOUTH_Y = 222.0f; XTRA_X = (float)s_w - 320.0f;
+    }
+    memset(s_band_was_used, 0, sizeof s_band_was_used);
 }
 
 /* =========================================================== main loop */
@@ -750,6 +935,7 @@ void face_core1_main(void) {
 
     uint64_t last_us = time_us_64();
     bool first = true;
+    uint8_t rot = 0;
     uint8_t last_glow = 255;
 
     while (true) {
@@ -765,6 +951,31 @@ void face_core1_main(void) {
         s_mouth_env = approach(s_mouth_env, mouth, mouth > s_mouth_env ? 30.0f : 14.0f, dt);
         const float mic = (float)g_face.mic / 255.0f;
         s_mic_env = approach(s_mic_env, mic, mic > s_mic_env ? 20.0f : 5.0f, dt);
+
+        if ((g_face.rotation & 3u) != rot) {
+            /* The board was turned. Turn the screen at once, but draw the face
+               turned by the same amount, so the picture doesn't jump; then
+               swing it upright (turn_angle). */
+            const uint8_t was = rot;
+            rot = g_face.rotation & 3u;
+            const float now_ang = turn_angle(now);
+            const unsigned dq = (unsigned)(rot - was) & 3u;   /* quarter turns clockwise */
+            float from = now_ang + (dq == 3u ? -1.0f : (float)dq) * 1.5707963f;
+            if (from > 3.2f) from -= 6.2831853f;
+            if (from < -3.2f) from += 6.2831853f;
+            st7789_set_rotation(rot);
+            apply_layout();
+            s_turn_from = from;
+            s_turn_ms = now;
+            /* a funny face, unless it's busy listening, thinking or talking */
+            s_turn_funny = s_mood != WILI_MOOD_LISTEN && s_mood != WILI_MOOD_THINK &&
+                           s_mood != WILI_MOOD_TALK;
+            s_activity_ms = now;
+            if (s_mood == WILI_MOOD_SLEEP || s_mood == WILI_MOOD_BORED) enter(WILI_MOOD_IDLE, now);
+            first = true;   /* repaint every band in the new orientation */
+        }
+        set_turn(turn_angle(now));
+        s_clip_screen = s_xf ? (clip_t){-200, -200, s_w + 200, s_h + 200} : (clip_t){0, 0, s_w, s_h};
 
         update_mood(now);
         target_pose(now, t);

@@ -89,10 +89,32 @@ index 4d4fe12..d7a646e 100644
   * `m_fSingleAssetVolumeAdjustment` role (default 1.0, matching rpI2S.h:69).
   * An app-layer asset table is the intended caller (see the header's note on
 diff --git a/bsp/display_cpu/lcd/st7789.c b/bsp/display_cpu/lcd/st7789.c
-index 6d58a8d..73343a1 100644
+index 6d58a8d..6c89795 100644
 --- a/bsp/display_cpu/lcd/st7789.c
 +++ b/bsp/display_cpu/lcd/st7789.c
-@@ -399,6 +399,43 @@ void st7789_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
+@@ -36,11 +36,18 @@ void st7789_encode_window(uint8_t *out, uint16_t start, uint16_t end) {
+     out[2] = (uint8_t)(end   >> 8); out[3] = (uint8_t)(end   & 0xFFu);
+ }
+ 
++/* The drawing area: 320x240 unless st7789_set_rotation() turned the panel to
++   portrait (added for apps/wili). */
++static uint16_t s_w = ST7789_W, s_h = ST7789_H;
++
++uint16_t st7789_width(void)  { return s_w; }
++uint16_t st7789_height(void) { return s_h; }
++
+ bool st7789_clip_rect(uint16_t x, uint16_t y, uint16_t *w, uint16_t *h) {
+     if (!w || !h || *w == 0u || *h == 0u) return false;
+-    if (x >= ST7789_W || y >= ST7789_H) return false;
+-    if ((uint32_t)x + *w > ST7789_W) *w = (uint16_t)(ST7789_W - x);
+-    if ((uint32_t)y + *h > ST7789_H) *h = (uint16_t)(ST7789_H - y);
++    if (x >= s_w || y >= s_h) return false;
++    if ((uint32_t)x + *w > s_w) *w = (uint16_t)(s_w - x);
++    if ((uint32_t)y + *h > s_h) *h = (uint16_t)(s_h - y);
+     return true;
+ }
+ 
+@@ -399,7 +406,57 @@ void st7789_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                            st7789_dma_xfer_count(w, h), true);
  }
  
@@ -134,13 +156,28 @@ index 6d58a8d..73343a1 100644
 +}
 +
  void st7789_clear(uint16_t color) {
-     st7789_fill_rect(0u, 0u, ST7789_W, ST7789_H, color);
+-    st7789_fill_rect(0u, 0u, ST7789_W, ST7789_H, color);
++    st7789_fill_rect(0u, 0u, s_w, s_h, color);
++}
++
++/* MADCTL for each quarter turn, clockwise from the normal landscape 0x70
++   (MX|MV|ML): the row/column order and exchange bits step through the four
++   orientations; ML (refresh order) is kept as it was. */
++static const uint8_t s_madctl_rot[4] = {0x70u, 0x10u, 0xB0u, 0xD0u};
++
++void st7789_set_rotation(uint8_t rot) {
++    rot &= 3u;
++    st7789_dma_wait();
++    cmd(REG_MADCTL, &s_madctl_rot[rot], 1);
++    s_w = (rot & 1u) ? ST7789_H : ST7789_W;
++    s_h = (rot & 1u) ? ST7789_W : ST7789_H;
  }
+ #endif
 diff --git a/bsp/display_cpu/lcd/st7789.h b/bsp/display_cpu/lcd/st7789.h
-index 735c0d3..257de68 100644
+index 735c0d3..9128f6d 100644
 --- a/bsp/display_cpu/lcd/st7789.h
 +++ b/bsp/display_cpu/lcd/st7789.h
-@@ -114,6 +114,9 @@ void st7789_blit(const uint16_t *px, size_t n);
+@@ -114,10 +114,21 @@ void st7789_blit(const uint16_t *px, size_t n);
   * Falls back to a synchronous chunk loop when no DMA channel could be
   * claimed. Out-of-range and zero-size rects are clipped away by
   * st7789_clip_rect() and draw nothing. */
@@ -150,3 +187,15 @@ index 735c0d3..257de68 100644
  void st7789_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h,
                        uint16_t color);
  void st7789_clear(uint16_t color);
+ 
++/* (added for apps/wili) Turn the picture a quarter turn at a time, clockwise:
++ * 0 = the normal 320x240 landscape, 1 and 3 = 240x320 portrait, 2 = upside
++ * down. Waits for any transfer in flight. Afterwards every rect is clipped to
++ * st7789_width() x st7789_height(); the caller redraws the whole screen. */
++void st7789_set_rotation(uint8_t rot);
++uint16_t st7789_width(void);
++uint16_t st7789_height(void);
++
+ /* True while a fill is still on the wire. False when no fill is in flight,
+  * and false on the synchronous fallback path, where fills are already
+  * complete by the time they return. */

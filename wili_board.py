@@ -12,6 +12,7 @@ counters, so callers never touch the serial port directly.
 
 from __future__ import annotations
 
+import collections
 import queue
 import struct
 import threading
@@ -26,8 +27,10 @@ VID, PID_DISPLAY = 0x093C, 0x2055
 
 MAGIC = b"\xf7\x1a"
 EV_HELLO, EV_MIC, EV_BUTTON, EV_SPK, EV_FACE = 0x01, 0x02, 0x03, 0x04, 0x05
+EV_ACCEL, EV_POWER = 0x06, 0x07   # firmware 005+
 CMD_PING, CMD_MIC, CMD_AUDIO, CMD_AUDIO_END, CMD_FLUSH = 0x10, 0x11, 0x12, 0x13, 0x14
 CMD_FACE, CMD_VOLUME, CMD_LEDS, CMD_CHIME, CMD_LED_LEVEL = 0x15, 0x16, 0x17, 0x18, 0x19
+CMD_ROTATE = 0x1A   # firmware 006+
 MAX_PAYLOAD = 1024
 
 # Built-in earcons (firmware 002+)
@@ -107,6 +110,24 @@ class SpeakerStatus:
     at: float = 0.0      # host time this status arrived
 
 
+@dataclass
+class PowerStatus:
+    """The BQ25896 charger's report (wili_proto.h wili_power_t)."""
+    ok: bool = False
+    vbus_stat: int = 0       # 0 none, 1 USB host, 2 adapter, 7 OTG
+    chg_stat: int = 0        # 0 not charging, 1 pre-charge, 2 fast charge, 3 done
+    usb_power: bool = False
+    fault: int = 0           # 0 ok, 1 input, 2 thermal shutdown, 3 safety timer
+    ts_rank: int = 0         # battery thermistor: 0 normal, 2 warm, 3 cool, 5 cold, 6 hot
+    thermal_reg: bool = False
+    ts_pct: int = 0
+    vbat_mv: int = 0
+    vsys_mv: int = 0
+    vbus_mv: int = 0
+    ichg_ma: int = 0
+    at: float = 0.0
+
+
 def find_port() -> str | None:
     for p in list_ports.comports():
         if p.vid == VID and p.pid == PID_DISPLAY:
@@ -133,6 +154,11 @@ class WiliBoard:
         self.hello: str | None = None
         self.face_shown: int | None = None
         self.spk = SpeakerStatus()
+        self.power: PowerStatus | None = None
+        self.speaker_busy_at = 0.0   # last time audio was sent or the board said it was playing
+        # (host time, x, y, z in milli-g), newest last; ~100 a second
+        self.accel: collections.deque[tuple[float, int, int, int]] = collections.deque(maxlen=1000)
+        self.accel_listeners: list = []   # called with each batch from the reader thread
         self.mic_samples = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -142,6 +168,8 @@ class WiliBoard:
 
     # ------------------------------------------------------------ io
     def _send(self, ftype: int, payload: bytes = b"") -> None:
+        if ftype in (CMD_AUDIO, CMD_CHIME):
+            self.speaker_busy_at = time.time()
         with self._lock:
             self.ser.write(frame(ftype, payload))
 
@@ -171,8 +199,24 @@ class WiliBoard:
                 elif ftype == EV_SPK and len(p) >= 20:
                     played, recv, drop, used, free, under, playing, end = struct.unpack_from("<IIIHHHBB", p)
                     self.spk = SpeakerStatus(played, recv, drop, used, free, under, bool(playing), bool(end), time.time())
+                    if playing or used:
+                        self.speaker_busy_at = self.spk.at
                 elif ftype == EV_FACE and p:
                     self.face_shown = p[0]
+                elif ftype == EV_ACCEL and len(p) >= 6:
+                    n = len(p) // 6
+                    now = time.time()
+                    batch = [(now - (n - 1 - i) * 0.01, *struct.unpack_from("<hhh", p, i * 6)) for i in range(n)]
+                    self.accel.extend(batch)
+                    for fn in self.accel_listeners:
+                        try:
+                            fn(batch)
+                        except Exception as exc:  # a listener bug must not kill the reader
+                            print(f"  (accel listener failed: {exc})")
+                elif ftype == EV_POWER and len(p) >= 16:
+                    v = struct.unpack_from("<8B4H", p)
+                    self.power = PowerStatus(bool(v[0]), v[1], v[2], bool(v[3]), v[4], v[5], bool(v[6]),
+                                             *v[7:], time.time())
                 elif ftype == EV_HELLO:
                     self.hello = p.decode(errors="replace")
 
@@ -213,6 +257,11 @@ class WiliBoard:
     def led_brightness(self, percent: float) -> None:
         """Dim the whole LED bar, 0-100 % (firmware 004+; default ~25 %)."""
         self._send(CMD_LED_LEVEL, bytes([max(0, min(255, round(percent * 255 / 100)))]))
+
+    def rotate(self, quarter_turns: int) -> None:
+        """Turn the face 0-3 quarter turns clockwise (firmware 006+; older
+        firmware ignores it)."""
+        self._send(CMD_ROTATE, bytes([quarter_turns & 3]))
 
     def volume(self, level: int) -> None:
         self._send(CMD_VOLUME, bytes([max(0, min(10, level))]))

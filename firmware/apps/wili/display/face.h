@@ -32,6 +32,8 @@ typedef struct {
     volatile uint8_t  shown;      /* mood core 1 is showing (core 1 writes)  */
     volatile uint32_t frames;     /* frames drawn (core 1 writes)            */
     volatile uint8_t  lcd_ok;     /* LCD came up (core 1 writes)             */
+    volatile uint8_t  rotation;   /* quarter turns clockwise, 0..3 (core 0
+                                     writes; core 1 turns the screen)        */
 } wili_face_t;
 
 extern wili_face_t g_face;

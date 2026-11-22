@@ -43,9 +43,11 @@ and a local voice.
 | `weather.py` | Weather from Open-Meteo: place lookup, forecast, wording |
 | `clock.py` | Local time and date questions, answered from the Mac's clock |
 | `status.py` | "Are you online?": checks the Open WebUI server and the language model |
+| `motion.py` | Double taps, pose (face down, upright) and screen rotation from the board's accelerometer |
+| `battery.py` | "How's your battery?": the charger's readings, in words |
 | `tts/` | Kokoro text-to-speech helper (`kokoro_server.mjs`, run by the assistant) |
 | `firmware/apps/wili/` | The board firmware: `display/` (face, audio, protocol) and `main/` |
-| `firmware/patches/` | Small additions to the toolkit's drivers (speaker stream mode, async LCD blit) |
+| `firmware/patches/` | Small additions to the toolkit's drivers (speaker stream mode, async LCD blit, LCD rotation) |
 | `firmware/wiliOGbsp/` | Free-Wili's [wiliOGbsp](https://github.com/freewili/wiliOGbsp) toolkit, as a submodule pinned to `3426c46` |
 | `firmware/build.sh` | Applies the patch, links the app in, builds/flashes with the toolkit |
 | `launchd/`, `scripts/` | Launch agent template, install/uninstall scripts, run wrapper |
@@ -153,6 +155,20 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
 - **Buttons:** white/gray starts a new conversation; any other button is
   push-to-talk. Holding **red for 6 s** powers the board off (on USB power it stays
   on until unplugged); holding gray wakes it.
+- **Double-tap the case** (two quick knocks, anywhere on it) to talk, the same as
+  pressing a button; it also stops a ringing timer. It goes by rhythm: two jolts a
+  fifth to half a second apart, with stillness before and after. Single taps,
+  picking it up or turning it don't count, and neither does TooGee's own voice
+  (taps are ignored while it speaks). A double knock on the desk right next to it,
+  or a mug set down hard enough to bounce, can.
+- **Turn it on its side or upside down** and the face swings round to stay upright,
+  overshooting a little like it's on a spring (on its side the screen is portrait,
+  so the face is laid out narrower and taller). It goes wide-eyed while it swings
+  and is dizzy for a moment after, with spinning spiral eyes, unless it's busy
+  listening, thinking or talking.
+- **Lay it face down** to stop it listening: the face sleeps and it ignores its
+  name, taps and buttons. Timers and reminders still ring. Stand it back up and
+  it perks up and listens again.
 - Left alone it gets **bored** after 45 s and **falls asleep** after 2.5 minutes
   (dim screen, Zzz). Saying its name wakes it with a start; poking a button makes it
   giggle.
@@ -192,6 +208,9 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
   work even when the server is down. Anything more ("what time does Costco close?",
   "what time is it in Tokyo?", "how many days until Christmas?") goes to the model,
   which is told the current date and time.
+- **Battery:** "how's your battery?", "are you charging?", "are you plugged in?".
+  The board's charger reports the battery voltage and charging state; with no fuel
+  gauge on the board, the level is estimated from the voltage and said as "about".
 - **Online check:** "are you online?", "are you connected?", "can you reach the
   server?", "is the LLM up?", "status check". TooGee checks that Open WebUI answers,
   then asks the language model for a few words, and says which part works: "Yes, I'm
@@ -254,7 +273,19 @@ reported ring level. Opening the port at 1200 baud still reboots into BOOTSEL.
 | `MIC` | 256 samples | `MIC` | start/stop mic stream |
 | `BUTTON` | down/pressed/released | `AUDIO` / `AUDIO_END` / `FLUSH` | speaker stream |
 | `SPK` | played/received/ring/underruns | `FACE` | mood |
-| `FACE` | mood now shown | `CHIME`, `VOLUME`, `LEDS`, `LED_LEVEL` | |
+| `FACE` | mood now shown | `CHIME`, `VOLUME`, `LEDS`, `LED_LEVEL`, `ROTATE` (006+) | |
+| `ACCEL` | x/y/z milli-g at 100 Hz (005+) | | |
+| `POWER` | charger: USB, charging, battery mV (005+) | | |
+
+The accelerometer (LIS3DH, ±2 g) is streamed raw and the gestures are worked out on
+the Mac (`motion.py`), so tuning them never needs a reflash. The charger (BQ25896) is
+only read, every 2 seconds; the firmware never reconfigures it. `ROTATE` turns the
+picture with the LCD controller's scan-direction register (a small addition to the
+toolkit's ST7789 driver, in `firmware/patches/`), and the face re-lays itself out
+for 240×320 when it's on its side. The swing is drawn by the face itself: it turns
+the screen at once, then draws the face rotated back by the same amount and eases
+that to zero, mapping each pixel into the face's own coordinates for the ~0.6 s it
+takes.
 
 **Wake word.** The mic stream is cut into speech bursts by level against a running
 noise floor. Each burst goes to a local Whisper model nudged with a prompt and hotword

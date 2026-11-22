@@ -3,7 +3,8 @@
  * Turns the FreeWili OG into a voice-assistant head for a host computer:
  *   - streams the PDM microphone to the host (8 kHz int16) on request,
  *   - plays int16 audio the host streams to it through the I2S speaker,
- *   - reports button presses,
+ *   - reports button presses, the accelerometer (100 Hz) and the charger's
+ *     battery/USB-power readings (every 2 s),
  *   - drives the LED bar from the face's mood,
  *   - and hands mood requests and audio envelopes to the face on core 1.
  * Protocol: wili_proto.h. Power: red held 6 s -> ship mode, as every app here.
@@ -21,7 +22,7 @@
 
 FWOG_POWER_DEFAULT();
 
-#define WILI_FW_VERSION "004"
+#define WILI_FW_VERSION "007"
 
 /* =========================================================== framing */
 
@@ -413,6 +414,9 @@ static void handle(uint8_t type, const uint8_t *p, uint16_t len) {
     case WILI_CMD_LED_LEVEL:
         if (len >= 1) s_led_level = p[0];
         break;
+    case WILI_CMD_ROTATE:
+        if (len >= 1) g_face.rotation = p[0] & 3u;
+        break;
     default:
         break;
     }
@@ -454,6 +458,66 @@ static void usb_rx_service(void) {
     }
 }
 
+/* =========================================================== sensors */
+
+/* Accelerometer: every new 100 Hz sample is queued and sent in batches; the
+   host does the gesture work (taps, face-down, pick-up), so tuning never
+   needs a reflash. lis3dh_process() leaves the sample untouched when there
+   is no new data yet, hence the sentinel. */
+#define ACCEL_BATCH 16u
+static bool s_accel_ok;
+static int16_t s_accel_q[ACCEL_BATCH * 3u];
+static unsigned s_accel_n;
+static uint32_t s_accel_next_poll, s_accel_next_send;
+
+static void accel_service(uint32_t now) {
+    if (!s_accel_ok) return;
+    if ((int32_t)(now - s_accel_next_poll) >= 0) {
+        s_accel_next_poll = now + 4u;
+        lis3dh_sample_t samp = {0x7FFF, 0x7FFF, 0x7FFF};
+        if (lis3dh_process(LIS3DH_MOVE_THRESHOLD_DEFAULT, &samp, NULL) &&
+            !(samp.x == 0x7FFF && samp.y == 0x7FFF && samp.z == 0x7FFF) &&
+            s_accel_n < ACCEL_BATCH) {
+            s_accel_q[s_accel_n * 3u + 0u] = (int16_t)lis3dh_raw_to_mg(samp.x, LIS3DH_RANGE_2G);
+            s_accel_q[s_accel_n * 3u + 1u] = (int16_t)lis3dh_raw_to_mg(samp.y, LIS3DH_RANGE_2G);
+            s_accel_q[s_accel_n * 3u + 2u] = (int16_t)lis3dh_raw_to_mg(samp.z, LIS3DH_RANGE_2G);
+            s_accel_n++;
+        }
+    }
+    if (s_accel_n && ((int32_t)(now - s_accel_next_send) >= 0 || s_accel_n == ACCEL_BATCH)) {
+        s_accel_next_send = now + 40u;
+        send_frame(WILI_EV_ACCEL, s_accel_q, (uint16_t)(s_accel_n * 6u), true);
+        s_accel_n = 0;   /* dropped if the host is behind: motion is live data */
+    }
+}
+
+/* Charger: read only. The BQ25896 charges on its power-on defaults; this
+   never resets or reconfigures it (bq25896_read_all() only re-arms the
+   ADC's continuous conversion). */
+static uint32_t s_power_next;
+
+static void power_service(uint32_t now) {
+    if ((int32_t)(now - s_power_next) < 0) return;
+    s_power_next = now + 2000u;
+    wili_power_t w = {0};
+    bq25896_telemetry_t t;
+    if (bq25896_read_all(&t)) {
+        w.ok = 1;
+        w.vbus_stat = (uint8_t)t.vbus_stat;
+        w.chg_stat = (uint8_t)t.chg_stat;
+        w.vbus_attached = t.vbus_attached ? 1u : 0u;
+        w.chg_fault = (uint8_t)t.chg_fault;
+        w.ts_rank = (uint8_t)t.ts_rank;
+        w.thermal_reg = t.thermal_regulation ? 1u : 0u;
+        w.tspct = (uint8_t)(t.tspct_percent + 0.5f);
+        w.vbat_mv = t.vbat_mv;
+        w.vsys_mv = t.vsys_mv;
+        w.vbus_mv = t.vbus_mv;
+        w.ichg_ma = t.ichg_ma;
+    }
+    send_frame(WILI_EV_POWER, &w, sizeof w, true);
+}
+
 /* =========================================================== main */
 
 int main(void) {
@@ -471,6 +535,12 @@ int main(void) {
     s_audio_ok = i2s_audio_init(pio0, 2u);
     if (s_audio_ok) i2s_audio_set_volume(9);
 
+    /* I2C1 is up (board_init). Turn on the charger's ADC once so the first
+       report already has fresh numbers. */
+    lis3dh_init();
+    s_accel_ok = lis3dh_configure(LIS3DH_RANGE_2G);
+    (void)bq25896_adc_continuous_enable();
+
     bool was_connected = false;
     uint8_t last_face = 0xFF;
     uint32_t next_led = 0, next_status = 0;
@@ -482,6 +552,10 @@ int main(void) {
         usb_rx_service();
         mic_service();
         spk_service(now);
+        if (stdio_usb_connected()) {
+            accel_service(now);
+            power_service(now);
+        }
 
         const bool connected = stdio_usb_connected();
         if (connected && !was_connected) send_hello();

@@ -52,6 +52,8 @@ import serial
 import alarms
 import clock
 import status
+import battery
+import motion
 import weather
 import wili_board as wb
 
@@ -675,8 +677,30 @@ class Board:
         print(f"Board: {self.wb.hello} on {self.wb.port}")
         self.wb.volume(cfg.volume)
         self.wb.led_brightness(cfg.led_brightness)
+        self.wb.rotate(0)   # in step with Motion's starting guess; it turns the face once it knows
         self.audio: list[int] = []
         self.mood: int | None = None
+        # Gestures (firmware 005+): a double tap is a button press; the pose
+        # (face down = don't listen) is read by the wake loop; turning the
+        # board turns the face (firmware 006+).
+        self.motion = motion.Motion()
+        self.pose = motion.UPRIGHT
+        self.wb.accel_listeners.append(self._on_accel)
+
+    TAP_QUIET_AFTER_SPEAKER = 0.4   # the speaker shakes the board as hard as a tap
+
+    def _on_accel(self, batch: list[tuple[float, int, int, int]]) -> None:
+        quiet = time.time() - self.wb.speaker_busy_at < self.TAP_QUIET_AFTER_SPEAKER
+        for t, x, y, z in batch:
+            for ev in self.motion.feed(t, x, y, z, quiet=quiet):
+                if ev == "double_tap":
+                    self.wb.events.put(("press", "tap"))
+                elif ev == "rotate":
+                    print(f"  (rotated: face turned {90 * self.motion.rotation} degrees)")
+                    self.wb.rotate(self.motion.rotation)
+                else:
+                    print(f"  (pose: {ev.replace('_', ' ')})")
+                    self.pose = ev
 
     def close(self) -> None:
         self.wb.close()
@@ -1107,6 +1131,17 @@ class Assistant:
         self.speak(answer)
         return True
 
+    def handle_battery_question(self, text: str) -> bool:
+        """The instant path: "how's your battery?" from the board's charger."""
+        if not battery.parse_battery_question(text):
+            return False
+        power = self.board.wb.power if self.board else None
+        print(f"  (battery: {battery.log_line(power)})")
+        answer = battery.describe(power)
+        print(f"{self.cfg.name.lower()}: {answer}")
+        self.speak(answer)
+        return True
+
     def handle_weather_question(self, text: str) -> bool:
         """The instant path: "what's the weather (in X)?" gets a one-sentence
         answer straight from Open-Meteo. Anything about later, or about rain,
@@ -1444,7 +1479,7 @@ class Assistant:
         self._said_slow = False
         if (self.handle_volume_command(heard) or self.handle_timer_command(heard)
                 or self.handle_clock_question(heard) or self.handle_status_question(heard)
-                or self.handle_weather_question(heard)):
+                or self.handle_battery_question(heard) or self.handle_weather_question(heard)):
             self.face(wb.IDLE)
             return
         self.face(wb.THINK)
@@ -1566,6 +1601,26 @@ class Assistant:
                 continue
             self.guarded(self.new_conversation if presses[0] == "gray" else self.turn)
 
+    def lie_face_down(self) -> None:
+        """Face down on the desk: stop listening for the name (the mic stream is
+        off) until it's stood back up. Timers and reminders still ring;
+        buttons and taps are ignored."""
+        b = self.board
+        assert b
+        print("  (face down: not listening)")
+        self.face(wb.SLEEP, force=True)
+        while b.pose == motion.FACE_DOWN:
+            due = self.alarms.due()
+            if due:
+                self.ring(due)
+                self.face(wb.SLEEP, force=True)
+            b.presses()
+            time.sleep(0.1)
+        print("  (back up: listening)")
+        self.face(wb.WAKE, force=True)
+        time.sleep(0.5)
+        self.face(wb.IDLE)
+
     # -- wake word -------------------------------------------------------------
     BURST_ON = 3.5        # x noise floor = speech
     BURST_END_SEC = 0.7   # this much quiet ends a burst
@@ -1603,7 +1658,10 @@ class Assistant:
                         break
                     for press in b.presses():
                         trigger = "white" if press == "gray" else "button"
-                        print(f"  ({press} button)")
+                        print("  (double tap)" if press == "tap" else f"  ({press} button)")
+                        break
+                    if trigger is None and b.pose == motion.FACE_DOWN:
+                        trigger = "face_down"
                         break
                     while trigger is None and len(b.audio) - checked >= blk:
                         level = rms(b.audio[checked: checked + blk])
@@ -1670,6 +1728,8 @@ class Assistant:
                 b.stop_stream()
             if trigger == "alarm":
                 self.guarded(self.ring, due)
+            elif trigger == "face_down":
+                self.guarded(self.lie_face_down)
             elif trigger == "white":
                 self.guarded(self.new_conversation)
             elif request is not None:
