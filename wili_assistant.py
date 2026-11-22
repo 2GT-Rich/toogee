@@ -697,7 +697,10 @@ class Board:
         print(f"Board: {self.wb.hello} on {self.wb.port}")
         self.wb.volume(cfg.volume)
         self.wb.led_brightness(cfg.led_brightness)
-        self.wb.rotate(0)   # in step with Motion's starting guess; it turns the face once it knows
+        # From firmware 008 the board turns its face itself (with or without
+        # this Mac); older firmware is turned from here.
+        if self.wb.firmware < 8:
+            self.wb.rotate(0)   # in step with Motion's starting guess; it turns the face once it knows
         self.audio: list[int] = []
         self.mood: int | None = None
         # Gestures (firmware 005+): a double tap is a button press; the pose
@@ -717,7 +720,8 @@ class Board:
                     self.wb.events.put(("press", "tap"))
                 elif ev == "rotate":
                     print(f"  (rotated: face turned {90 * self.motion.rotation} degrees)")
-                    self.wb.rotate(self.motion.rotation)
+                    if self.wb.firmware < 8:
+                        self.wb.rotate(self.motion.rotation)
                 else:
                     print(f"  (pose: {ev.replace('_', ' ')})")
                     self.pose = ev

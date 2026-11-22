@@ -6,7 +6,9 @@
  *   - reports button presses, the accelerometer (100 Hz) and the charger's
  *     battery/USB-power readings (every 2 s),
  *   - drives the LED bar from the face's mood,
- *   - and hands mood requests and audio envelopes to the face on core 1.
+ *   - hands mood requests and audio envelopes to the face on core 1,
+ *   - and, on its own, turns the face to match how the board is held, and
+ *     (with no host connected) sleeps while it lies face down.
  * Protocol: wili_proto.h. Power: red held 6 s -> ship mode, as every app here.
  */
 #include <string.h>
@@ -22,7 +24,7 @@
 
 FWOG_POWER_DEFAULT();
 
-#define WILI_FW_VERSION "007"
+#define WILI_FW_VERSION "008"
 
 /* =========================================================== framing */
 
@@ -414,7 +416,7 @@ static void handle(uint8_t type, const uint8_t *p, uint16_t len) {
     case WILI_CMD_LED_LEVEL:
         if (len >= 1) s_led_level = p[0];
         break;
-    case WILI_CMD_ROTATE:
+    case WILI_CMD_ROTATE:   /* from 008 the board turns the face itself; still honoured */
         if (len >= 1) g_face.rotation = p[0] & 3u;
         break;
     default:
@@ -462,15 +464,64 @@ static void usb_rx_service(void) {
 
 /* Accelerometer: every new 100 Hz sample is queued and sent in batches; the
    host does the gesture work (taps, face-down, pick-up), so tuning never
-   needs a reflash. lis3dh_process() leaves the sample untouched when there
-   is no new data yet, hence the sentinel. */
+   needs a reflash. The board itself only does what has to work without the
+   host too (on_board_motion below). lis3dh_process() leaves the sample
+   untouched when there is no new data yet, hence the sentinel. */
 #define ACCEL_BATCH 16u
 static bool s_accel_ok;
 static int16_t s_accel_q[ACCEL_BATCH * 3u];
 static unsigned s_accel_n;
 static uint32_t s_accel_next_poll, s_accel_next_send;
 
-static void accel_service(uint32_t now) {
+/* On the board, from smoothed gravity (same thresholds as the host's
+   motion.py):
+   - which way up the screen is, so the face turns to match -- always, host
+     or not: 800 mg in the screen's plane, held 0.5 s;
+   - face down = asleep, stood back up = awake -- only while no host is
+     connected (with one, the host sets the face, and mutes itself):
+     750 mg into the desk, held 0.8 s. */
+#define ROT_MG        800
+#define ROT_HOLD_MS   500u
+#define POSE_MG       750
+#define POSE_HOLD_MS  800u
+static float s_gx, s_gy = -1000.0f, s_gz;
+static uint8_t s_rot_cand;
+static uint32_t s_rot_since;
+static bool s_face_down, s_fd_cand;
+static uint32_t s_fd_since;
+
+static void on_board_motion(int16_t x, int16_t y, int16_t z, uint32_t now, bool host) {
+    s_gx += 0.1f * ((float)x - s_gx);
+    s_gy += 0.1f * ((float)y - s_gy);
+    s_gz += 0.1f * ((float)z - s_gz);
+
+    /* standing y = -1 g; on its right side x = +1 g; upside down y = +1 g */
+    int rot = -1;
+    if (s_gy <= -ROT_MG) rot = 0;
+    else if (s_gx >= ROT_MG) rot = 1;
+    else if (s_gy >= ROT_MG) rot = 2;
+    else if (s_gx <= -ROT_MG) rot = 3;
+    if (rot < 0 || (uint8_t)rot != s_rot_cand) {   /* flat, in between, or new */
+        s_rot_cand = rot < 0 ? g_face.rotation : (uint8_t)rot;
+        s_rot_since = now;
+    } else if ((uint8_t)rot != g_face.rotation && now - s_rot_since >= ROT_HOLD_MS) {
+        g_face.rotation = (uint8_t)rot;
+    }
+
+    const bool fd = s_gz <= -POSE_MG;
+    if (fd != s_fd_cand) {
+        s_fd_cand = fd;
+        s_fd_since = now;
+    } else if (fd != s_face_down && now - s_fd_since >= POSE_HOLD_MS) {
+        s_face_down = fd;
+        if (!host) {
+            if (fd) face_set_mood(WILI_MOOD_SLEEP);
+            else g_face.poke_seq++;        /* a poke wakes a sleeping face */
+        }
+    }
+}
+
+static void accel_service(uint32_t now, bool host) {
     if (!s_accel_ok) return;
     if ((int32_t)(now - s_accel_next_poll) >= 0) {
         s_accel_next_poll = now + 4u;
@@ -481,7 +532,9 @@ static void accel_service(uint32_t now) {
             s_accel_q[s_accel_n * 3u + 0u] = (int16_t)lis3dh_raw_to_mg(samp.x, LIS3DH_RANGE_2G);
             s_accel_q[s_accel_n * 3u + 1u] = (int16_t)lis3dh_raw_to_mg(samp.y, LIS3DH_RANGE_2G);
             s_accel_q[s_accel_n * 3u + 2u] = (int16_t)lis3dh_raw_to_mg(samp.z, LIS3DH_RANGE_2G);
-            s_accel_n++;
+            on_board_motion(s_accel_q[s_accel_n * 3u + 0u], s_accel_q[s_accel_n * 3u + 1u],
+                            s_accel_q[s_accel_n * 3u + 2u], now, host);
+            if (host) s_accel_n++;
         }
     }
     if (s_accel_n && ((int32_t)(now - s_accel_next_send) >= 0 || s_accel_n == ACCEL_BATCH)) {
@@ -552,16 +605,17 @@ int main(void) {
         usb_rx_service();
         mic_service();
         spk_service(now);
-        if (stdio_usb_connected()) {
-            accel_service(now);
-            power_service(now);
-        }
-
         const bool connected = stdio_usb_connected();
+        accel_service(now, connected);
+        if (connected) power_service(now);
+
         if (connected && !was_connected) send_hello();
         if (!connected && was_connected) {
             s_mic_stream = false;      /* host went away */
             spk_flush();
+            /* Don't stay stuck thinking or talking: back to being on its own
+               (asleep if it's lying face down). */
+            face_set_mood(s_face_down ? WILI_MOOD_SLEEP : WILI_MOOD_IDLE);
         }
         was_connected = connected;
 

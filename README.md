@@ -174,6 +174,10 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
 - **Lay it face down** to stop it listening: the face sleeps and it ignores its
   name, taps and buttons. Timers and reminders still ring. Stand it back up and
   it perks up and listens again.
+- **Without the Mac** (unplugged and on battery, or TooGee not running) it can't
+  hear or talk, but it's still a face: it turns with the board, sleeps face down
+  and wakes when stood up, gets bored and dozes off, and giggles when you press a
+  button. If the Mac goes away mid-answer, the face goes back to idle.
 - Left alone it gets **bored** after 45 s and **falls asleep** after 2.5 minutes
   (dim screen, Zzz). Saying its name wakes it with a start; poking a button makes it
   giggle.
@@ -278,13 +282,16 @@ reported ring level. Opening the port at 1200 baud still reboots into BOOTSEL.
 | `MIC` | 256 samples | `MIC` | start/stop mic stream |
 | `BUTTON` | down/pressed/released | `AUDIO` / `AUDIO_END` / `FLUSH` | speaker stream |
 | `SPK` | played/received/ring/underruns | `FACE` | mood |
-| `FACE` | mood now shown | `CHIME`, `VOLUME`, `LEDS`, `LED_LEVEL`, `ROTATE` (006+) | |
+| `FACE` | mood now shown | `CHIME`, `VOLUME`, `LEDS`, `LED_LEVEL`, `ROTATE` (006+; unused from 008) | |
 | `ACCEL` | x/y/z milli-g at 100 Hz (005+) | | |
 | `POWER` | charger: USB, charging, battery mV (005+) | | |
 
 The accelerometer (LIS3DH, ±2 g) is streamed raw and the gestures are worked out on
-the Mac (`motion.py`), so tuning them never needs a reflash. The charger (BQ25896) is
-only read, every 2 seconds; the firmware never reconfigures it. `ROTATE` turns the
+the Mac (`motion.py`), so tuning them never needs a reflash. Only what has to work
+without the Mac runs on the board too, with the same thresholds: from firmware 008
+it turns the face itself (always), and sleeps face down (only while no Mac is
+connected; with one, TooGee sets the face). The charger (BQ25896) is
+only read, every 2 seconds; the firmware never reconfigures it. Turning the face turns the
 picture with the LCD controller's scan-direction register (a small addition to the
 toolkit's ST7789 driver, in `firmware/patches/`), and the face re-lays itself out
 for 240×320 when it's on its side. The swing is drawn by the face itself: it turns

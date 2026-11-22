@@ -258,6 +258,14 @@ class WiliBoard:
         """Dim the whole LED bar, 0-100 % (firmware 004+; default ~25 %)."""
         self._send(CMD_LED_LEVEL, bytes([max(0, min(255, round(percent * 255 / 100)))]))
 
+    @property
+    def firmware(self) -> int:
+        """The firmware's version number, from its hello ("WILI 1 008" -> 8); 0 if unknown."""
+        try:
+            return int((self.hello or "").split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
     def rotate(self, quarter_turns: int) -> None:
         """Turn the face 0-3 quarter turns clockwise (firmware 006+; older
         firmware ignores it)."""
