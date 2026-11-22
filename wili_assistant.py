@@ -378,21 +378,27 @@ def reconcile(remote: str, local: str) -> tuple[str, str]:
     return text, f"remote {remote!r} with local start"
 
 
-def pick_request(remote: str, local: str) -> tuple[str, str]:
+def pick_request(remote: str, local: str, wake: str | None = None) -> tuple[str, str]:
     """The request text for "TooGee, <request>" in one breath, from Open
     WebUI's transcript (`remote`, of the audio after the name) and the local
     request model's (`local`, of the whole burst). In fast speech the local
     one is the more reliable (see WakeName.request), so it wins unless Open
     WebUI's -- after reconcile() has repaired its start -- says nearly the
     same thing, in which case Open WebUI's spelling (WILI_VOCAB names,
-    numbers) is used. Returns (text, how it was chosen)."""
-    fixed, how = reconcile(remote, local)
-    if how.startswith("local"):
-        return local, how
+    numbers) is used. `wake` is the wake model's transcript of the request:
+    when Open WebUI agrees with it and the request model doesn't, two of
+    three win. Returns (text, how it was chosen)."""
     chars = lambda t: re.sub(r"[^a-z0-9]", "", t.lower())
-    if difflib.SequenceMatcher(None, chars(fixed), chars(local), autojunk=False).ratio() >= 0.8:
+    fixed, how = reconcile(remote, local)
+    if not how.startswith("local") and \
+            difflib.SequenceMatcher(None, chars(fixed), chars(local), autojunk=False).ratio() >= 0.8:
         return fixed, how
-    return local, f"local (remote heard {remote!r})"
+    if wake and remote.strip():
+        voted, how_w = reconcile(remote, wake)
+        if not how_w.startswith("local") and \
+                difflib.SequenceMatcher(None, chars(voted), chars(local), autojunk=False).ratio() < 0.8:
+            return voted, f"{how_w}, agreeing with the wake model (request model heard {local!r})"
+    return local, how if how.startswith("local") else f"local (remote heard {remote!r})"
 
 
 def to_wav(samples: list[int], rate: int = RATE) -> bytes:
@@ -577,7 +583,7 @@ class WakeName:
             print(f"Loading the local request model ({request_model}) ...")
             self.request_model = WhisperModel(request_model, device="cpu", compute_type="int8")
 
-    def request(self, samples: list[int]) -> str:
+    def request(self, samples: list[int]) -> tuple[str, bool]:
         """What was said after the name, from the whole burst (name included,
         trailing quiet already trimmed), with the request model.
 
@@ -585,10 +591,15 @@ class WakeName:
         the audio after the name, got 5 of 11 right ("attempted." for "what
         time is it?", "Thank you very much for having me." for "set a timer
         for five minutes"); small.en on the whole burst, which hears the
-        request in context, got 9 of 11, in ~0.9 s."""
+        request in context, got 9 of 11, in ~0.9 s.
+
+        Also returns whether it heard the name. The wake model already did, so
+        when this one didn't, it misheard the burst ("hi, didn't I?" for
+        "TooGee, how are you doing tonight?", "101" for "TooGee, what time is
+        it?", 2026-11-21) and its text shouldn't be trusted."""
         text, _ = self._transcribe(samples, model=self.request_model)
         rest = self.match(text)
-        return tidy_local(text if rest is None else rest)
+        return tidy_local(text if rest is None else rest), rest is not None
 
     @staticmethod
     def _pattern(name: str) -> re.Pattern:
@@ -1548,8 +1559,11 @@ class Assistant:
                 heard = ""
             if worker:
                 worker.join()
+            if local.get("text") and not local.get("named"):
+                print(f"  (request model missed the name, heard {local['text']!r}; not using it)")
+                local = {}
             if local.get("text"):
-                heard, how = pick_request(heard, local["text"])
+                heard, how = pick_request(heard, local["text"], fallback)
             elif fallback:
                 heard, how = reconcile(heard, fallback)
             else:
@@ -1564,7 +1578,10 @@ class Assistant:
             if whole and self.wake:  # no audio worth sending on: just use the request model
                 local = {}
                 self._local_request(whole, local)
-                heard = local.get("text") or heard
+                if local.get("named"):
+                    heard = local.get("text") or heard
+                elif local.get("text"):
+                    print(f"  (request model missed the name, heard {local['text']!r}; not using it)")
         if self.wake:
             heard = self.wake.strip(heard)
         if heard.lower().strip() in HALLUCINATIONS:
@@ -1576,7 +1593,7 @@ class Assistant:
 
     def _local_request(self, whole: list[int], out: dict) -> None:
         try:
-            out["text"] = self.wake.request(whole)
+            out["text"], out["named"] = self.wake.request(whole)
         except Exception as exc:  # the remote transcript still stands
             print(f"  (local request model failed: {exc})")
 
