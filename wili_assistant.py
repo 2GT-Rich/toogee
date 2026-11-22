@@ -452,6 +452,17 @@ def sentences(text: str, max_len: int = 220) -> list[str]:
     return final
 
 
+def asks_question(text: str) -> bool:
+    """Does a reply end by asking the user something? Its last sentence is a
+    question, or a short one follows a question ("Want a timer? Just say so.")."""
+    parts = [p.strip().rstrip("\"')]”’ ") for p in re.split(r"(?<=[.!?])\s+", speakable(text)) if p.strip()]
+    if not parts:
+        return False
+    if parts[-1].endswith("?"):
+        return True
+    return len(parts) >= 2 and parts[-2].endswith("?") and len(parts[-1].split()) <= 6
+
+
 # --------------------------------------------------------------------------- text to speech
 class SayTTS:
     """macOS `say`, rendered straight to the board's format."""
@@ -797,7 +808,8 @@ class Board:
             self.audio.extend(block)
             block = self.wb.read_mic(timeout=0)
 
-    def chime_and_capture(self, noise: float | None = None, since: int | None = None) -> list[int]:
+    def chime_and_capture(self, noise: float | None = None, since: int | None = None,
+                          wait_speech_sec: float = 5.0) -> list[int]:
         """Chime, then record the request, starting once the chime has died away.
         `since` (an index into self.audio, where the name ended) lets a request
         that's already begun be kept whole instead.
@@ -813,10 +825,10 @@ class Board:
             # started before the chime. Chiming now would talk over them and
             # throw that start away, so just keep listening from the name.
             print("  (already talking; listening without the chime)")
-            return self.capture(noise=noise, begin_at=since)
+            return self.capture(noise=noise, begin_at=since, wait_speech_sec=wait_speech_sec)
         sent_at = len(self.audio)
         self.chime(wb.CHIME_LISTEN)
-        return self.capture(noise=noise, chime_at=sent_at)
+        return self.capture(noise=noise, chime_at=sent_at, wait_speech_sec=wait_speech_sec)
 
     def _talking_since(self, since: int, noise: float | None) -> bool:
         """Two or more loud 50 ms blocks in the audio after `since`. Only ~0.3 s
@@ -942,6 +954,7 @@ class Assistant:
         self.history: list[dict] = []
         self._before_mute = int(load_state().get("before_mute", cfg.volume or 7))
         self._mute_after_reply = False
+        self._last_said = ""     # what it said last: a question there means listen for the answer
         if cfg.volume == 0:
             print("  (starting muted -- say \"unmute\" to hear me)")
         self.alarms = alarms.Alarms(load_state().get("alarms"), lambda items: save_state(alarms=items))
@@ -1459,6 +1472,7 @@ class Assistant:
         return results
 
     def speak(self, text: str) -> None:
+        self._last_said = text
         self.face(wb.TALK)
         if self.board and self.cfg.speaker == "board":
             self.board.say(text)
@@ -1568,6 +1582,44 @@ class Assistant:
         except Exception as exc:  # the remote transcript still stands
             print(f"  (local request model failed: {exc})")
 
+    FOLLOW_UP_WAIT_SEC = 6.0   # how long to wait for an answer to its question
+
+    def converse(self, *args) -> None:
+        """One exchange, then -- for as long as TooGee ends by asking something --
+        listen for the answer without needing the name or a button."""
+        self._last_said = ""
+        self.guarded(self.turn, *args)
+        while self.board and asks_question(self._last_said):
+            self._last_said = ""
+            samples = self.listen_for_answer()
+            if not samples:
+                self.face(wb.IDLE)
+                break
+            self.guarded(self.turn, samples)
+
+    def listen_for_answer(self) -> list[int]:
+        """Chime and listen once; [] if nobody answers (or a button is pressed,
+        or it's laid face down: that's a "never mind")."""
+        b = self.board
+        assert b
+        if b.pose == motion.FACE_DOWN:
+            return []
+        print("  (asked a question: listening for the answer)")
+        self.face(wb.LISTEN)
+        b.start_stream()
+        b.presses()
+        try:
+            samples = b.chime_and_capture(wait_speech_sec=self.FOLLOW_UP_WAIT_SEC)
+            pressed = b.presses()
+        finally:
+            b.stop_stream()
+        if pressed or b.pose == motion.FACE_DOWN:
+            print("  (never mind)")
+            return []
+        if not samples:
+            print("  (no answer)")
+        return samples
+
     def new_conversation(self) -> None:
         self.history.clear()
         print("  (new conversation)")
@@ -1599,7 +1651,10 @@ class Assistant:
             if not presses:
                 time.sleep(0.05)
                 continue
-            self.guarded(self.new_conversation if presses[0] == "gray" else self.turn)
+            if presses[0] == "gray":
+                self.guarded(self.new_conversation)
+            else:
+                self.converse()
 
     def lie_face_down(self) -> None:
         """Face down on the desk: stop listening for the name (the mic stream is
@@ -1733,9 +1788,9 @@ class Assistant:
             elif trigger == "white":
                 self.guarded(self.new_conversation)
             elif request is not None:
-                self.guarded(self.turn, None, request, None, whole)
+                self.converse(None, request, None, whole)
             else:
-                self.guarded(self.turn, command, None, fallback, whole)
+                self.converse(command, None, fallback, whole)
 
 
 def check(cfg: Config, owui: OpenWebUI) -> None:

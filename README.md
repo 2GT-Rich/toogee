@@ -152,6 +152,11 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
   the face perks up)* … "what's the weather in Seattle?".
 - A **falling chime** means it heard you and is thinking; a **low tone** means
   something went wrong.
+- **When TooGee asks you something** ("Which city?", "Want me to set a
+  reminder?"), it chimes and listens for your answer, with no name or button
+  needed, and keeps going like that for as long as it keeps asking. Say nothing
+  for 6 seconds, press a button, or lay it face down, and it goes back to waiting
+  for its name.
 - **Buttons:** white/gray starts a new conversation; any other button is
   push-to-talk. Holding **red for 6 s** powers the board off (on USB power it stays
   on until unplugged); holding gray wakes it.
