@@ -39,7 +39,7 @@ and a local voice.
 | --- | --- |
 | `wili_assistant.py` | The assistant: wake word, listening, Open WebUI, web search, speech |
 | `wili_board.py` | Host side of the board's USB protocol (mic, speaker, face, buttons, LEDs) |
-| `alarms.py` | Timers and reminders: storage, time parsing, the alarm bell |
+| `alarms.py` | Timers, reminders and alarms: storage, repeats, time parsing, the bell |
 | `weather.py` | Weather from Open-Meteo: place lookup, forecast, wording |
 | `clock.py` | Local time and date questions, answered from the Mac's clock |
 | `status.py` | "Are you online?": checks the Open WebUI server and the language model |
@@ -172,7 +172,7 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
   and is dizzy for a moment after, with spinning spiral eyes, unless it's busy
   listening, thinking or talking.
 - **Lay it face down** to stop it listening: the face sleeps and it ignores its
-  name, taps and buttons. Timers and reminders still ring. Stand it back up and
+  name, taps and buttons. Timers, reminders and alarms still ring. Stand it back up and
   it perks up and listens again.
 - **Without the Mac** (unplugged and on battery, or TooGee not running) it can't
   hear or talk, but it's still a face: it turns with the board, sleeps face down
@@ -202,6 +202,20 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
   reminders. They survive restarts; one that came due while TooGee was off is
   announced when it's back ("While I was off, you had a reminder…") if it's under
   six hours old.
+- **Alarms:** "set an alarm for 7 am", "wake me up at 6:30 tomorrow", "alarm for
+  6:45 every weekday", "set an alarm for 8 on weekends", "…every Monday and
+  Wednesday", "…for 5:30 pm on Friday", and "cancel my alarm", "turn off the 7 am
+  alarm", "delete all my alarms". Those are handled instantly (so they work with
+  the server down too); anything else ("move my alarm to 7:30", "what alarms do I
+  have?") goes to the model's `set_alarm` and the timer tools. Without "am" or "pm",
+  a repeating alarm or one for a given day is in the morning, and otherwise it's
+  whichever comes first; TooGee always says which it set, and "no, AM" fixes it.
+  An alarm rings like a timer but longer: a longer bell and "It's 7 AM. Time to
+  get up!", again every 20 seconds for about four minutes until you answer, press
+  a button or double-tap. "Snooze" gives you five more minutes ("snooze for ten
+  minutes" works too). A repeating alarm sets itself for its next day as it rings.
+  If TooGee was off when an alarm was due, it still rings if it's under 15 minutes
+  late; a later one is skipped (a repeating one just waits for its next day).
 - **Weather:** "what's the weather?", "how's the weather in Portland, Maine?",
   "will it rain tomorrow?", "do I need a jacket tonight?", "what's the weekend
   looking like?". Plain "what's the weather (in X)" is answered instantly from

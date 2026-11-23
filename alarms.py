@@ -1,9 +1,12 @@
-"""Timers and reminders for TooGee.
+"""Timers, reminders and alarms for TooGee.
 
-An Alarm is either a timer ("5 minutes") or a reminder ("take the trash out",
-at 7 pm). Alarms are kept in the assistant's state file, so they survive a
-restart; anything that came due while TooGee was off is announced when it comes
-back, if it's less than MISSED_MAX_SEC old.
+An Alarm is a timer ("5 minutes"), a reminder ("take the trash out", at 7 pm)
+or an alarm clock (7 AM, once or repeating: every day, weekdays, weekends or
+given days). They're kept in the assistant's state file, so they survive a
+restart. A timer or reminder that came due while TooGee was off is announced
+when it comes back, if it's less than MISSED_MAX_SEC old; an alarm only if
+it's less than ALARM_LATE_SEC late (nobody wants a wake-up call at noon), and a
+repeating one is simply moved on to its next day.
 
 This module is pure logic plus a synthesised bell; the assistant decides when
 to ring and how to talk about it.
@@ -19,17 +22,81 @@ import time
 from dataclasses import asdict, dataclass, field
 
 MISSED_MAX_SEC = 6 * 3600
+ALARM_LATE_SEC = 15 * 60
+
+DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]          # time.localtime().tm_wday order
+DAY_NAMES = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+REPEATS = {"daily": DAYS, "weekdays": DAYS[:5], "weekends": DAYS[5:]}
+
+
+def repeat_days(repeat: str) -> list[int]:
+    """'weekdays' -> [0..4]; 'mon,wed' -> [0, 2]; '' -> [] (once)."""
+    r = repeat.lower().strip()
+    names = REPEATS.get(r) or [d.strip()[:3] for d in r.split(",") if d.strip()]
+    return sorted({DAYS.index(d) for d in names if d in DAYS})
+
+
+def normalize_repeat(repeat: str) -> str:
+    """Canonical form: '', 'daily', 'weekdays', 'weekends' or 'mon,wed,fri'."""
+    days = repeat_days(repeat)
+    for name, ds in REPEATS.items():
+        if days == [DAYS.index(d) for d in ds]:
+            return name
+    return ",".join(DAYS[d] for d in days)
+
+
+def next_at(clock: str, repeat: str = "", after: float | None = None, date: str = "") -> float:
+    """The next time the clock reads `clock` ("07:30") after `after`: on one
+    of the repeat days, on `date` ("YYYY-MM-DD") if given, else the first."""
+    after = time.time() if after is None else after
+    hh, mm = (int(x) for x in clock.split(":"))
+    if date:
+        y, mo, d = (int(x) for x in date.split("-"))
+        return time.mktime((y, mo, d, hh, mm, 0, 0, 0, -1))
+    days = repeat_days(repeat)
+    base = time.localtime(after)
+    for i in range(8):
+        t = time.mktime((base.tm_year, base.tm_mon, base.tm_mday + i, hh, mm, 0, 0, 0, -1))
+        if t > after and (not days or time.localtime(t).tm_wday in days):
+            return t
+    raise ValueError(f"no next time for {clock} {repeat}")
+
+
+def say_hhmm(clock: str) -> str:
+    """'07:00' -> '7 AM', '18:30' -> '6:30 PM', '12:00' -> 'noon'."""
+    hh, mm = (int(x) for x in clock.split(":"))
+    if (hh, mm) == (12, 0):
+        return "noon"
+    if (hh, mm) == (0, 0):
+        return "midnight"
+    h12 = hh % 12 or 12
+    return f"{h12}{f':{mm:02d}' if mm else ''} {'AM' if hh < 12 else 'PM'}"
+
+
+def say_repeat(repeat: str) -> str:
+    r = normalize_repeat(repeat)
+    if not r:
+        return ""
+    if r == "daily":
+        return "every day"
+    if r in ("weekdays", "weekends"):
+        return f"on {r}"
+    names = [DAY_NAMES[DAYS.index(d)] + "s" for d in r.split(",")]
+    return "on " + (names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1])
 
 
 @dataclass
 class Alarm:
     id: int
-    kind: str            # "timer" or "reminder"
+    kind: str            # "timer", "reminder" or "alarm"
     due: float           # epoch seconds
-    label: str = ""      # timer name ("pasta") or reminder text ("take the trash out")
+    label: str = ""      # timer name ("pasta"), reminder text ("take the trash out"), alarm note ("gym")
     duration: int = 0    # timers: the length that was asked for, in seconds
     created: float = field(default_factory=time.time)
     missed: bool = False  # came due while TooGee wasn't running
+    clock: str = ""      # alarms: "07:30", local time
+    repeat: str = ""     # alarms: "", "daily", "weekdays", "weekends" or "mon,wed,fri"
+    snoozed: bool = False  # alarms: this is a snooze of one
 
     def describe(self, now: float | None = None) -> str:
         now = time.time() if now is None else now
@@ -37,6 +104,13 @@ class Alarm:
         if self.kind == "timer":
             name = f"{self.label} timer" if self.label else f"{say_duration(self.duration, adjective=True)} timer"
             return f"{name}, {say_duration(left)} left" if left > 0 else f"{name}, done"
+        if self.kind == "alarm":
+            out = f"{say_hhmm(self.clock)} alarm" + (f" for {self.label}" if self.label else "")
+            if self.repeat:
+                return f"{out} {say_repeat(self.repeat)} (next {say_clock(self.due, now)})"
+            if self.snoozed:
+                return f"{out}, snoozed until {say_clock(self.due, now)}"
+            return f"{out}, {say_day(self.due, now)}"
         return f"reminder to {_lower_first(self.label)} at {say_clock(self.due, now)}"
 
     def announcement(self) -> str:
@@ -44,6 +118,12 @@ class Alarm:
             if self.label:
                 return f"Your {self.label} timer is done!"
             return f"Your {say_duration(self.duration, adjective=True)} timer is done!"
+        if self.kind == "alarm":
+            now = say_hhmm(time.strftime("%H:%M", time.localtime(self.due)))
+            if self.label:
+                return f"It's {now}. Time for {_lower_first(self.label).rstrip('.')}!"
+            return f"It's {now}. Time to get up!" if time.localtime(self.due).tm_hour < 11 \
+                else f"It's {now}. This is your alarm."
         lead = "While I was off, you had a reminder: " if self.missed else "Reminder: "
         return lead + self.label.rstrip(".") + "."
 
@@ -62,9 +142,14 @@ class Alarms:
             except (TypeError, KeyError):
                 continue
             if a.due < now:
-                if now - a.due > MISSED_MAX_SEC:
+                if a.kind == "alarm" and now - a.due > ALARM_LATE_SEC:
+                    if not a.repeat:
+                        continue      # a wake-up call hours late is no use
+                    a.due = next_at(a.clock, a.repeat, now)
+                elif now - a.due > MISSED_MAX_SEC:
                     continue          # too stale to be useful
-                a.missed = True
+                elif a.kind != "alarm":
+                    a.missed = True
             self._items.append(a)
         self._next_id = max((a.id for a in self._items), default=0) + 1
 
@@ -90,6 +175,33 @@ class Alarms:
             self._persist()
         return a
 
+    def add_alarm(self, clock: str, repeat: str = "", label: str = "", date: str = "") -> Alarm:
+        """An alarm at `clock` ("07:30"), once (the next time, or on `date`) or
+        repeating."""
+        hh, mm = (int(x) for x in clock.split(":"))
+        if not (0 <= hh < 24 and 0 <= mm < 60):
+            raise ValueError(f"bad time {clock!r}")
+        clock = f"{hh:02d}:{mm:02d}"
+        repeat = "" if date else normalize_repeat(repeat)
+        due = next_at(clock, repeat, date=date)
+        if due <= time.time():
+            raise ValueError(f"{date} {clock} is in the past")
+        with self._lock:
+            a = Alarm(self._next_id, "alarm", due, label.strip(), clock=clock, repeat=repeat)
+            self._next_id += 1
+            self._items.append(a)
+            self._persist()
+        return a
+
+    def snooze_alarm(self, alarm: Alarm, seconds: float) -> Alarm:
+        with self._lock:
+            a = Alarm(self._next_id, "alarm", time.time() + seconds, alarm.label,
+                      clock=alarm.clock, snoozed=True)
+            self._next_id += 1
+            self._items.append(a)
+            self._persist()
+        return a
+
     def pending(self) -> list[Alarm]:
         with self._lock:
             return sorted(self._items, key=lambda a: a.due)
@@ -103,6 +215,9 @@ class Alarms:
                 return None
             a = min(ready, key=lambda x: x.due)
             self._items.remove(a)
+            if a.kind == "alarm" and a.repeat:   # it'll ring again on its next day
+                self._items.append(Alarm(a.id, "alarm", next_at(a.clock, a.repeat, max(now, a.due)),
+                                         a.label, clock=a.clock, repeat=a.repeat))
             self._persist()
             return a
 
@@ -117,7 +232,8 @@ class Alarms:
                 gone = pool
             elif m:
                 gone = [a for a in pool if m in a.label.lower()
-                        or (a.kind == "timer" and m in say_duration(a.duration))]
+                        or (a.kind == "timer" and m in say_duration(a.duration))
+                        or (a.kind == "alarm" and _same_clock(m, a.clock))]
             else:
                 gone = pool if len(pool) == 1 else []
             for a in gone:
@@ -125,6 +241,20 @@ class Alarms:
             if gone:
                 self._persist()
             return gone
+
+
+def _same_clock(said: str, clock: str) -> bool:
+    """Does '7 am', '7:30', '07:30' or '7' name the alarm at `clock`?"""
+    m = re.fullmatch(r"\s*(\d{1,2})(?::(\d\d))?\s*(am|pm|a\.m\.|p\.m\.)?\s*", said.lower())
+    if not m:
+        return said.lower() in say_hhmm(clock).lower()
+    hh, mm = (int(x) for x in clock.split(":"))
+    h, mi, ap = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").replace(".", "")
+    if mi != mm:
+        return False
+    if ap:
+        return (h % 12) + (12 if ap == "pm" else 0) == hh
+    return h in (hh, hh % 12, (hh % 12) or 12)
 
 
 # --------------------------------------------------------------------------- speaking times
@@ -165,6 +295,18 @@ def say_clock(due: float, now: float | None = None) -> str:
     if day == time.strftime("%Y%m%d", time.localtime(now + 86400)):
         return f"{clock} tomorrow"
     return time.strftime("%A %B %-d at ", t) + clock
+
+
+def say_day(due: float, now: float | None = None) -> str:
+    """'today', 'tonight', 'tomorrow' or 'on Monday, November 23'."""
+    now = time.time() if now is None else now
+    t = time.localtime(due)
+    day = time.strftime("%Y%m%d", t)
+    if day == time.strftime("%Y%m%d", time.localtime(now)):
+        return "tonight" if t.tm_hour >= 18 else "today"
+    if day == time.strftime("%Y%m%d", time.localtime(now + 86400)):
+        return "tomorrow"
+    return time.strftime("on %A, %B %-d", t)
 
 
 def parse_local_time(iso: str, now: float | None = None) -> float:
@@ -226,6 +368,135 @@ def parse_timer_command(text: str) -> tuple[int, str] | None:
                                                          "will", "go", "make", "put", "ll", "s"} and len(w) > 1]
         label = " ".join(words)
     return int(round(total)), label
+
+
+_HOURWORD = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve".split())}
+_MINWORD = {"oclock": 0, "o clock": 0, "oh five": 5, "ten": 10, "fifteen": 15, "twenty": 20,
+            "twenty five": 25, "thirty": 30, "thirty five": 35, "forty": 40, "forty five": 45,
+            "fifty": 50, "fifty five": 55}
+_AMPM = r"(a ?m|p ?m)"
+_ALARM_NO = re.compile(r"\b(?:cancel|stop|delete|remove|turn off|switch off|disable|clear|what|whats|when|which|"
+                       r"list|how|snooze|change|move|reset|any|do i have|is my|are my)\b")
+_DAYWORD = {d: i for i, d in enumerate(["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])}
+
+
+def _clean(text: str) -> str:
+    t = text.lower().replace("’", "'").replace("'", "").replace("-", " ")
+    t = re.sub(r"\b([ap])\.\s?m\.?", r"\1m", t)          # a.m. -> am
+    t = re.sub(r"(\d)[.:](\d\d)\b", r"\1:\2", t)          # 7.30 -> 7:30
+    t = re.sub(r"[^a-z0-9: ]+", " ", t)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _find_time(t: str) -> tuple[int, int, str] | None:
+    """(hour, minute, 'am'/'pm'/'') from 'seven thirty am', '6:45', 'half past six', 'noon'."""
+    if re.search(r"\bnoon\b|\bmidday\b", t):
+        return 12, 0, "pm"
+    if re.search(r"\bmidnight\b", t):
+        return 0, 0, "am"
+    hw = "|".join(sorted(_HOURWORD, key=len, reverse=True))
+    m = re.search(rf"\b(half|quarter) (past|after|to|til|till) (\d{{1,2}}|{hw})\b(?: {_AMPM}\b)?", t)
+    if m:
+        h = int(m.group(3)) if m.group(3).isdigit() else _HOURWORD[m.group(3)]
+        mins = 30 if m.group(1) == "half" else 15
+        if m.group(2) in ("to", "til", "till"):
+            h, mins = (h - 1) % 24, 60 - mins
+        return h, mins, (m.group(4) or "").replace(" ", "")
+    # Speech recognition writes "3:45 pm" as "345 pm": run-together digits are
+    # a time when am/pm or "for"/"at" says so (not a bare "2024").
+    m = re.search(rf"\b(\d{{1,2}})([0-5]\d)(?!\d)(?: ?{_AMPM}\b)?", t)
+    if m and (m.group(3) or re.search(rf"\b(?:for|at|to) {m.group(1)}{m.group(2)}\b", t)):
+        return int(m.group(1)), int(m.group(2)), (m.group(3) or "").replace(" ", "")
+    m = re.search(rf"\b(\d{{1,2}})(?::(\d\d)| (\d\d)\b)?(?: ?{_AMPM}\b)?", t)
+    if m and (m.group(2) or m.group(3) or m.group(4) or re.search(rf"\b(?:for|at|to) {m.group(1)}\b", t)):
+        h, mins = int(m.group(1)), int(m.group(2) or m.group(3) or 0)
+        return h, mins, (m.group(4) or "").replace(" ", "")
+    mw = "|".join(sorted(_MINWORD, key=len, reverse=True))
+    m = re.search(rf"\b({hw})(?: ({mw}))?(?: {_AMPM})?\b", t)
+    if m and _HOURWORD[m.group(1)] > 0 and (m.group(2) or m.group(3)
+                                             or re.search(rf"\b(?:for|at|to) {m.group(1)}\b", t)):
+        return _HOURWORD[m.group(1)], _MINWORD.get(m.group(2) or "", 0), (m.group(3) or "").replace(" ", "")
+    return None
+
+
+def parse_alarm_command(text: str, now: float | None = None) -> tuple[str, str, str] | None:
+    """'Set an alarm for 7 am', 'wake me up at six thirty tomorrow', 'alarm for
+    6:45 every weekday' -> (clock 'HH:MM', repeat, date 'YYYY-MM-DD' or '').
+    Anything fancier (or a question about alarms) is left to the model.
+
+    Without am/pm: a repeating alarm, or one for a given day, is in the
+    morning; otherwise it's whichever of the two comes first. TooGee says
+    which it set, so a wrong guess is easy to catch."""
+    now = time.time() if now is None else now
+    t = _clean(text)
+    if not re.search(r"\balarm\b|\bwake me\b|\bwake us\b", t) or len(t.split()) > 16 or _ALARM_NO.search(t):
+        return None
+    if re.search(r"\b(?:in|for) (?:\d+|[a-z]+) (?:minute|min|hour|hr|second)s?\b", t):
+        return None                     # "an alarm in 20 minutes" is a timer: the model knows
+    found = _find_time(t)
+    if not found:
+        return None
+    h, mins, ap = found
+    if not ap:
+        if re.search(r"\b(?:in the morning|this morning|morning)\b", t):
+            ap = "am"
+        elif re.search(r"\b(?:tonight|this evening|in the evening|in the afternoon|this afternoon|evening|afternoon)\b", t):
+            ap = "pm"
+    if h > 23 or mins > 59 or (ap and not 1 <= h <= 12):
+        return None
+    if ap:
+        h = h % 12 + (12 if ap == "pm" else 0)
+
+    repeat = ""
+    if re.search(r"\b(?:every ?day|daily|every morning|every night|each day|each morning)\b", t):
+        repeat = "daily"
+    elif re.search(r"\bweekdays?\b|\bwork ?days?\b", t):
+        repeat = "weekdays"
+    elif re.search(r"\bweekends?\b", t):
+        repeat = "weekends"
+    days = [d for d, i in _DAYWORD.items() if re.search(rf"\b{d}s?\b", t)]
+    date = ""
+    if days and not repeat:
+        if re.search(r"\bevery\b|\b(?:mon|tues|wednes|thurs|fri|satur|sun)days\b", t):
+            repeat = ",".join(DAYS[_DAYWORD[d]] for d in days)
+        else:   # "on Monday": the next one
+            lt = time.localtime(now)
+            ahead = (_DAYWORD[days[0]] - lt.tm_wday) % 7 or 7
+            date = time.strftime("%Y-%m-%d", time.localtime(time.mktime(
+                (lt.tm_year, lt.tm_mon, lt.tm_mday + ahead, 12, 0, 0, 0, 0, -1))))
+    if re.search(r"\btomorrow\b", t) and not repeat:
+        date = time.strftime("%Y-%m-%d", time.localtime(now + 86400))
+
+    if not ap and h <= 12:
+        if repeat or date:
+            h = h % 12 if h < 12 else 12          # morning (12 -> noon)
+        else:
+            first = min((next_at(f"{hh:02d}:{mins:02d}", after=now), hh) for hh in {h % 12, h % 12 + 12})
+            h = first[1]
+    return f"{h:02d}:{mins:02d}", repeat, date
+
+
+def parse_alarm_cancel(text: str) -> tuple[str, bool] | None:
+    """'Cancel my alarm', 'turn off the 7 am alarm', 'delete all my alarms'
+    -> (time said, or '', all?)."""
+    t = _clean(text)
+    if not re.search(r"\balarms?\b", t) or len(t.split()) > 10:
+        return None
+    if not re.search(r"\b(?:cancel|delete|remove|turn off|switch off|disable|clear|get rid of)\b", t):
+        return None
+    if re.search(r"\b(?:timer|reminder|tomorrow|today|skip|just|only|next)\b", t):
+        return None                     # e.g. "turn off tomorrow's alarm only": the model
+    every = bool(re.search(r"\b(?:all|every|both)\b", t))
+    found = _find_time(t)
+    if not found:
+        m = re.search(r"\b(\d{1,2})(?::(\d\d))?\b", t)       # "the 7 alarm"
+        found = (int(m.group(1)), int(m.group(2) or 0), "") if m else None
+    said = ""
+    if found:
+        h, mins, ap = found
+        said = f"{h}:{mins:02d}" + (f" {ap}" if ap else "")
+    return said, every
 
 
 _DISMISS_SNOOZE = re.compile(rf"\bsnooze(?: (?:it|for|me))*(?: {_NUM} (minute|min|hour|second)s?)?\b")

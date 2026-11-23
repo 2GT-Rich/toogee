@@ -1035,18 +1035,33 @@ class Assistant:
             }, "required": ["text"]},
         }},
         {"type": "function", "function": {
+            "name": "set_alarm",
+            "description": "Set an alarm clock: it rings at a local time, once or on repeat, until "
+                           "the user answers. Use this (not set_reminder) for 'set an alarm' and "
+                           "'wake me up'. For an alarm 'in 20 minutes' use set_timer.",
+            "parameters": {"type": "object", "properties": {
+                "time": {"type": "string", "description": "local time, 24-hour HH:MM, e.g. '06:30'"},
+                "repeat": {"type": "string", "description": "leave out for a one-time alarm; else 'daily', "
+                           "'weekdays', 'weekends' or days like 'mon,wed,fri'"},
+                "date": {"type": "string", "description": "one-time alarm on a given day, YYYY-MM-DD "
+                         "(leave out for the next time the clock shows `time`)"},
+                "label": {"type": "string", "description": "optional, what it's for, e.g. 'the gym'"},
+            }, "required": ["time"]},
+        }},
+        {"type": "function", "function": {
             "name": "list_timers",
-            "description": "List the running timers and upcoming reminders, with time left.",
+            "description": "List the running timers, upcoming reminders and alarms, with time left.",
             "parameters": {"type": "object", "properties": {}},
         }},
         {"type": "function", "function": {
             "name": "cancel_timer",
-            "description": "Cancel timers or reminders. With `match`, those whose name or text "
-                           "contains it; with all=true, every one (optionally only of `kind`).",
+            "description": "Cancel timers, reminders or alarms. With `match`, those whose name or "
+                           "text contains it (for an alarm, its time like '7 am' or '6:30' works "
+                           "too); with all=true, every one (optionally only of `kind`).",
             "parameters": {"type": "object", "properties": {
                 "match": {"type": "string"},
                 "all": {"type": "boolean"},
-                "kind": {"type": "string", "enum": ["timer", "reminder", "any"]},
+                "kind": {"type": "string", "enum": ["timer", "reminder", "alarm", "any"]},
             }},
         }},
     ]
@@ -1090,10 +1105,18 @@ class Assistant:
             a = self.alarms.add_reminder(due, text)
             print(f"  (reminder set: {a.describe()})")
             return f"Reminder set: {a.describe()} (in {alarms.say_duration(due - now)})."
+        if name == "set_alarm":
+            try:
+                a = self.alarms.add_alarm(str(args.get("time") or ""), str(args.get("repeat") or ""),
+                                          str(args.get("label") or ""), str(args.get("date") or ""))
+            except (ValueError, OverflowError) as exc:
+                return f"Error: {exc}. Give time as HH:MM (24-hour) and date as YYYY-MM-DD."
+            print(f"  (alarm set: {a.describe()})")
+            return f"Alarm set: {a.describe()}, in {alarms.say_duration(a.due - now)}. Confirm it in a few words."
         if name == "list_timers":
             items = self.alarms.pending()
             return ("Pending: " + "; ".join(a.describe(now) for a in items) + ".") if items \
-                else "There are no timers or reminders."
+                else "There are no timers, reminders or alarms."
         if name == "cancel_timer":
             kind = str(args.get("kind") or "any")
             gone = self.alarms.cancel(str(args.get("match") or ""), bool(args.get("all")),
@@ -1117,6 +1140,53 @@ class Assistant:
         name = f"{label} timer" if label else "timer"
         self.speak(f"Okay, {name} for {alarms.say_duration(secs)}, starting now.")
         return True
+
+    def handle_alarm_command(self, text: str) -> bool:
+        """The instant path: "set an alarm for 7 am", "wake me up at 6:30 every
+        weekday", "cancel my alarm" skip the model (so they work offline too)."""
+        cmd = alarms.parse_alarm_command(text)
+        if cmd:
+            clock, repeat, date = cmd
+            try:
+                a = self.alarms.add_alarm(clock, repeat, date=date)
+            except (ValueError, OverflowError) as exc:
+                print(f"  (alarm command {cmd} failed: {exc}; asking the model)")
+                return False
+            print(f"  (alarm command: {a.describe()})")
+            when = alarms.say_hhmm(a.clock)
+            if a.repeat:
+                self.speak(f"Okay, alarm set for {when} {alarms.say_repeat(a.repeat)}, "
+                           f"starting {alarms.say_day(a.due).removeprefix('on ')}.")
+            else:
+                self.speak(f"Okay, alarm set for {when} {alarms.say_day(a.due)}.")
+            return True
+        cancel = alarms.parse_alarm_cancel(text)
+        if not cancel:
+            return False
+        said, every = cancel
+        have = [a for a in self.alarms.pending() if a.kind == "alarm"]
+        if not have:
+            self.speak("You don't have any alarms set.")
+            return True
+        gone = self.alarms.cancel(said, every or (not said and len(have) == 1), kind="alarm")
+        if not gone:
+            if said:
+                self.speak(f"I couldn't find an alarm for {said}. "
+                           + self._say_alarms(have))
+            else:
+                self.speak(f"You have {len(have)} alarms. Which one? " + self._say_alarms(have))
+            return True
+        print(f"  (cancelled: {'; '.join(a.describe() for a in gone)})")
+        if len(gone) == 1:
+            self.speak(f"Okay, I turned off your {gone[0].describe().split(' (next')[0].split(', ')[0]}.")
+        else:
+            self.speak(f"Okay, I turned off all {len(gone)} of your alarms.")
+        return True
+
+    @staticmethod
+    def _say_alarms(items) -> str:
+        names = [a.describe().split(" (next")[0] for a in items]
+        return "You have: " + "; ".join(names) + "."
 
     def handle_clock_question(self, text: str) -> bool:
         """The instant path: "what time is it?" / "what's the date?" are read
@@ -1190,8 +1260,9 @@ class Assistant:
         self.speak(answer)
         return True
 
-    RING_TRIES = {"timer": 3, "reminder": 2}
-    RING_GAP_SEC = 12.0
+    RING_TRIES = {"timer": 3, "reminder": 2, "alarm": 8}   # an alarm keeps at it for ~4 minutes
+    RING_GAP_SEC = {"alarm": 20.0}
+    RING_GAP_DEFAULT_SEC = 12.0
 
     def ring(self, alarm: alarms.Alarm) -> None:
         """An alarm is due: bell, flash, announce, then listen a few seconds
@@ -1199,7 +1270,7 @@ class Assistant:
         "snooze [N minutes]" re-arms it. Repeats if nobody answers."""
         b = self.board
         print(f"  (ALARM: {alarm.announcement()})")
-        bell = alarms.bell_pcm(RATE)
+        bell = alarms.bell_pcm(RATE, dings=6 if alarm.kind == "alarm" else 3)
         tries = self.RING_TRIES.get(alarm.kind, 2)
         for attempt in range(tries):
             self.face(wb.WAKE, force=True)
@@ -1214,7 +1285,7 @@ class Assistant:
             reply = self._alarm_reply(wait_sec=6.0)
             if reply is None and attempt < tries - 1:
                 self.face(wb.IDLE)
-                end = time.time() + self.RING_GAP_SEC
+                end = time.time() + self.RING_GAP_SEC.get(alarm.kind, self.RING_GAP_DEFAULT_SEC)
                 while time.time() < end and reply is None:
                     if b.presses():
                         reply = ("dismiss", 0)
@@ -1225,10 +1296,13 @@ class Assistant:
             if action == "snooze":
                 if alarm.kind == "timer":
                     self.alarms.add_timer(secs, alarm.label, duration=alarm.duration)
+                elif alarm.kind == "alarm":
+                    self.alarms.snooze_alarm(alarm, secs)
                 else:
                     self.alarms.add_reminder(time.time() + secs, alarm.label)
                 print(f"  (snoozed {alarms.say_duration(secs)})")
-                self.speak(f"Okay, I'll remind you again in {alarms.say_duration(secs)}.")
+                self.speak(f"Okay, snoozing for {alarms.say_duration(secs)}." if alarm.kind == "alarm"
+                           else f"Okay, I'll remind you again in {alarms.say_duration(secs)}.")
                 self.face(wb.IDLE)
             else:
                 print("  (alarm dismissed)")
@@ -1356,10 +1430,10 @@ class Assistant:
         now = time.strftime("%A, %B %-d, %Y, %-I:%M %p %Z")
         system = f"{self.cfg.prompt}\nThe current local date and time is {now}."
         tools = list(self.TIMER_TOOLS)
-        system += (f" (In ISO form, now is {time.strftime('%Y-%m-%dT%H:%M')}.) You can set timers and "
-                   "reminders with set_timer and set_reminder, see them with list_timers and remove "
-                   "them with cancel_timer; for reminders at a clock time pass `at` as local "
-                   "YYYY-MM-DDTHH:MM. When you set one, confirm it in a few words.")
+        system += (f" (In ISO form, now is {time.strftime('%Y-%m-%dT%H:%M')}.) You can set timers, "
+                   "reminders and alarms with set_timer, set_reminder and set_alarm, see them with "
+                   "list_timers and remove them with cancel_timer; for reminders at a clock time pass "
+                   "`at` as local YYYY-MM-DDTHH:MM. When you set one, confirm it in a few words.")
         if self.can_set_volume():
             tools.append(self.VOLUME_TOOL)
             system += (f" Your speaker volume is {self.cfg.volume} out of 10; use set_volume when "
@@ -1416,12 +1490,12 @@ class Assistant:
         TooGee says "let me look that up", since a search takes ~5-10 s."""
         results: list[str] = ["Unknown tool."] * len(calls)
 
-        # Volume, timer and reminder calls are instant; do them here, before any
-        # searches start.
+        # Volume, weather, timer, reminder and alarm calls are quick; do them
+        # here, before any searches start.
         for i, call in enumerate(calls):
             fn = call.get("function") or {}
-            if fn.get("name") not in ("set_volume", "set_timer", "set_reminder", "list_timers", "cancel_timer",
-                                    "get_weather"):
+            timer_names = {t["function"]["name"] for t in self.TIMER_TOOLS}
+            if fn.get("name") not in timer_names | {"set_volume", "get_weather"}:
                 continue
             try:
                 args = json.loads(fn.get("arguments") or "{}")
@@ -1505,8 +1579,14 @@ class Assistant:
         print(f"you:  {heard}")
         self._said_slow = False
         if (self.handle_volume_command(heard) or self.handle_timer_command(heard)
+                or self.handle_alarm_command(heard)
                 or self.handle_clock_question(heard) or self.handle_status_question(heard)
                 or self.handle_battery_question(heard) or self.handle_weather_question(heard)):
+            # Into the history too, so a follow-up ("no, 7 AM", "the 6:30 one")
+            # reaches the model with the context.
+            if self._last_said:
+                self.history += [{"role": "user", "content": heard},
+                                 {"role": "assistant", "content": self._last_said}]
             self.face(wb.IDLE)
             return
         self.face(wb.THINK)

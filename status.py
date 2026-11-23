@@ -170,7 +170,7 @@ def check_llm(url: str, key: str, model: str, timeout: float = 30.0) -> LLM:
 
 
 # ------------------------------------------------------------------ the answer
-STILL_CAN = "I can still tell you the time, set timers and change my volume."
+STILL_CAN = "I can still tell you the time, set timers and alarms, and change my volume."
 
 
 def _seconds(sec: float) -> str:
