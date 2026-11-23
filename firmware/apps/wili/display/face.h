@@ -9,6 +9,10 @@
 
 #include <stdint.h>
 
+#include "hardware/sync.h"
+
+#define WILI_CAPTION_MAX 24   /* characters of caption text (firmware 009+) */
+
 typedef enum {
     WILI_MOOD_IDLE = 0,   /* awake, waiting: blinks, glances, breathes        */
     WILI_MOOD_LISTEN,     /* attentive, eyes react to the mic                 */
@@ -34,6 +38,8 @@ typedef struct {
     volatile uint8_t  lcd_ok;     /* LCD came up (core 1 writes)             */
     volatile uint8_t  rotation;   /* quarter turns clockwise, 0..3 (core 0
                                      writes; core 1 turns the screen)        */
+    volatile uint32_t caption_seq;  /* odd while core 0 is writing caption   */
+    volatile char     caption[WILI_CAPTION_MAX + 1];   /* "" = none         */
 } wili_face_t;
 
 extern wili_face_t g_face;
@@ -42,6 +48,20 @@ extern wili_face_t g_face;
 static inline void face_set_mood(wili_mood_t m) {
     g_face.mood = (uint8_t)m;
     g_face.mood_seq++;
+}
+
+/* Set (or with len 0 clear) the line of text along the bottom of the screen,
+   e.g. "sleeping... 29:41". Core 0 only; core 1 copies it when the sequence
+   number is even and unchanged across the copy. */
+static inline void face_set_caption(const uint8_t *p, unsigned len) {
+    if (len > WILI_CAPTION_MAX) len = WILI_CAPTION_MAX;
+    g_face.caption_seq++;
+    __dmb();
+    for (unsigned i = 0; i < len; i++)
+        g_face.caption[i] = (p[i] >= 32u && p[i] < 127u) ? (char)p[i] : ' ';
+    g_face.caption[len] = 0;
+    __dmb();
+    g_face.caption_seq++;
 }
 
 void face_core1_main(void);

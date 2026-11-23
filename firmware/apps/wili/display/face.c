@@ -72,7 +72,7 @@ typedef struct {
     int32_t  a, b, c;          /* type-specific, see adders */
 } prim_t;
 
-#define MAX_PRIMS 64
+#define MAX_PRIMS 96   /* the face, its extras and a caption */
 static prim_t s_prims[MAX_PRIMS];
 static int s_nprims;
 
@@ -797,6 +797,37 @@ static void compose_mouth(float cx, float cy, float open) {
     }
 }
 
+/* The caption (firmware 009+), copied from g_face when core 0 has finished
+   writing it. */
+static char s_caption[WILI_CAPTION_MAX + 1];
+static uint32_t s_caption_seen;
+
+static void read_caption(void) {
+    const uint32_t seq = g_face.caption_seq;
+    if (seq == s_caption_seen || (seq & 1u)) return;
+    __dmb();
+    char tmp[WILI_CAPTION_MAX + 1];
+    for (int i = 0; i <= WILI_CAPTION_MAX; i++) tmp[i] = g_face.caption[i];
+    __dmb();
+    if (g_face.caption_seq != seq) return;   /* rewritten meanwhile: next frame */
+    tmp[WILI_CAPTION_MAX] = 0;
+    memcpy(s_caption, tmp, sizeof s_caption);
+    s_caption_seen = seq;
+}
+
+static void compose_caption(void) {
+    const int n = (int)strlen(s_caption);
+    if (n == 0) return;
+    int sc = 2;
+    if (n * LCD_GLYPH_W * sc > s_w - 8) sc = 1;   /* too long for big letters */
+    const float w = (float)(n * LCD_GLYPH_W * sc);
+    const float x0 = CX - w * 0.5f;
+    const float y = (float)s_h - (float)(LCD_GLYPH_H * sc) - 10.0f;
+    for (int i = 0; i < n; i++)
+        if (s_caption[i] != ' ')
+            add_glyph(s_caption[i], x0 + (float)(i * LCD_GLYPH_W * sc), y, sc, C_TEXT, 0.9f);
+}
+
 static void compose(uint32_t now, float t, float open_blink) {
     s_nprims = 0;
     s_now = now;
@@ -860,6 +891,7 @@ static void compose(uint32_t now, float t, float open_blink) {
             add_glyph(i == 1 ? 'Z' : 'z', x, y, sc, C_TEXT, a);
         }
     }
+    compose_caption();
 }
 
 /* =========================================================== rotation */
@@ -978,6 +1010,7 @@ void face_core1_main(void) {
         s_clip_screen = s_xf ? (clip_t){-200, -200, s_w + 200, s_h + 200} : (clip_t){0, 0, s_w, s_h};
 
         update_mood(now);
+        read_caption();
         target_pose(now, t);
         ease_pose(dt);
         compose(now, t, blink_open(now));

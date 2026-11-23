@@ -43,7 +43,8 @@ and a local voice.
 | `weather.py` | Weather from Open-Meteo: place lookup, forecast, wording |
 | `clock.py` | Local time and date questions, answered from the Mac's clock |
 | `status.py` | "Are you online?": checks the Open WebUI server and the language model |
-| `motion.py` | Double taps, pose (face down, upright) and screen rotation from the board's accelerometer |
+| `motion.py` | Double and triple taps, pose (face down, upright) and screen rotation from the board's accelerometer |
+| `nap.py` | "Go to sleep for 30 minutes": understanding it, and the countdown |
 | `battery.py` | "How's your battery?": the charger's readings, in words |
 | `tts/` | Kokoro text-to-speech helper (`kokoro_server.mjs`, run by the assistant) |
 | `firmware/apps/wili/` | The board firmware: `display/` (face, audio, protocol) and `main/` |
@@ -174,6 +175,13 @@ exits, and TooGee itself waits and reconnects if the board is unplugged or refla
 - **Lay it face down** to stop it listening: the face sleeps and it ignores its
   name, taps and buttons. Timers, reminders and alarms still ring. Stand it back up and
   it perks up and listens again.
+- **Tell it to sleep** when a noisy room keeps waking it by mishearing its name:
+  "go to sleep for 30 minutes", "take a nap until 3 pm", "stop listening for an
+  hour", or just "go to sleep" (until woken). It turns its mic off, sleeps, and
+  shows the time left under the face ("sleeping... 29:41", firmware 009+). Timers,
+  reminders and alarms still ring. It wakes when the time's up, when you **tap it
+  three times**, or press any button; a double tap doesn't wake it, so a bumped
+  desk won't either.
 - **Without the Mac** (unplugged and on battery, or TooGee not running) it can't
   hear or talk, but it's still a face: it turns with the board, sleeps face down
   and wakes when stood up, gets bored and dozes off, and giggles when you press a
@@ -297,6 +305,7 @@ reported ring level. Opening the port at 1200 baud still reboots into BOOTSEL.
 | `BUTTON` | down/pressed/released | `AUDIO` / `AUDIO_END` / `FLUSH` | speaker stream |
 | `SPK` | played/received/ring/underruns | `FACE` | mood |
 | `FACE` | mood now shown | `CHIME`, `VOLUME`, `LEDS`, `LED_LEVEL`, `ROTATE` (006+; unused from 008) | |
+| | | `CAPTION` (009+) | a line of text under the face, e.g. a sleep countdown |
 | `ACCEL` | x/y/z milli-g at 100 Hz (005+) | | |
 | `POWER` | charger: USB, charging, battery mV (005+) | | |
 

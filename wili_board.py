@@ -31,6 +31,8 @@ EV_ACCEL, EV_POWER = 0x06, 0x07   # firmware 005+
 CMD_PING, CMD_MIC, CMD_AUDIO, CMD_AUDIO_END, CMD_FLUSH = 0x10, 0x11, 0x12, 0x13, 0x14
 CMD_FACE, CMD_VOLUME, CMD_LEDS, CMD_CHIME, CMD_LED_LEVEL = 0x15, 0x16, 0x17, 0x18, 0x19
 CMD_ROTATE = 0x1A   # firmware 006+
+CMD_CAPTION = 0x1B  # firmware 009+
+CAPTION_MAX = 24
 MAX_PAYLOAD = 1024
 
 # Built-in earcons (firmware 002+)
@@ -270,6 +272,13 @@ class WiliBoard:
         """Turn the face 0-3 quarter turns clockwise (firmware 006+; older
         firmware ignores it)."""
         self._send(CMD_ROTATE, bytes([quarter_turns & 3]))
+
+    def caption(self, text: str) -> None:
+        """Show a line of text (up to 24 ASCII characters) along the bottom of
+        the screen, e.g. "sleeping... 29:41"; "" clears it (firmware 009+;
+        older firmware ignores it)."""
+        data = text.encode("ascii", "replace")[:CAPTION_MAX]
+        self._send(CMD_CAPTION, data)
 
     def volume(self, level: int) -> None:
         self._send(CMD_VOLUME, bytes([max(0, min(10, level))]))

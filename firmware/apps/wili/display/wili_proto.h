@@ -49,6 +49,10 @@
 #define WILI_CMD_LED_LEVEL 0x19u /* u8 0..255 global LED brightness (default 64) */
 #define WILI_CMD_ROTATE   0x1Au  /* (firmware 006+) u8 0..3: turn the face a
                                     quarter turn at a time, clockwise        */
+#define WILI_CMD_CAPTION  0x1Bu  /* (firmware 009+) up to 24 ASCII chars shown
+                                    along the bottom of the screen, e.g.
+                                    "sleeping... 29:41"; empty clears it.
+                                    Cleared when the host goes away.         */
 
 #define WILI_CHIME_LISTEN 1u     /* rising blip-blip: "I'm listening"           */
 #define WILI_CHIME_DONE   2u     /* falling blip-blip: "got it"                 */

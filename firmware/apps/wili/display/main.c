@@ -6,7 +6,8 @@
  *   - reports button presses, the accelerometer (100 Hz) and the charger's
  *     battery/USB-power readings (every 2 s),
  *   - drives the LED bar from the face's mood,
- *   - hands mood requests and audio envelopes to the face on core 1,
+ *   - hands mood requests, audio envelopes and a caption line (e.g. a sleep
+ *     countdown) to the face on core 1,
  *   - and, on its own, turns the face to match how the board is held, and
  *     (with no host connected) sleeps while it lies face down.
  * Protocol: wili_proto.h. Power: red held 6 s -> ship mode, as every app here.
@@ -24,7 +25,7 @@
 
 FWOG_POWER_DEFAULT();
 
-#define WILI_FW_VERSION "008"
+#define WILI_FW_VERSION "009"
 
 /* =========================================================== framing */
 
@@ -419,6 +420,9 @@ static void handle(uint8_t type, const uint8_t *p, uint16_t len) {
     case WILI_CMD_ROTATE:   /* from 008 the board turns the face itself; still honoured */
         if (len >= 1) g_face.rotation = p[0] & 3u;
         break;
+    case WILI_CMD_CAPTION:
+        face_set_caption(p, len);
+        break;
     default:
         break;
     }
@@ -616,6 +620,7 @@ int main(void) {
             /* Don't stay stuck thinking or talking: back to being on its own
                (asleep if it's lying face down). */
             face_set_mood(s_face_down ? WILI_MOOD_SLEEP : WILI_MOOD_IDLE);
+            face_set_caption(NULL, 0);   /* e.g. a sleep countdown nobody runs now */
         }
         was_connected = connected;
 

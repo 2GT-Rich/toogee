@@ -11,7 +11,7 @@ target_compile_definitions(wili_display PRIVATE
     CFG_TUD_CDC_RX_BUFSIZE=4096
     CFG_TUD_CDC_TX_BUFSIZE=4096)
 fwog_display_app(wili_display
-    VERSION 008
+    VERSION 009
     DESCRIPTION "Wili voice assistant head: animated face, USB mic/speaker streaming, buttons, mood LEDs")
 
 add_executable(wili_main main/main.c)
@@ -19,5 +19,5 @@ target_link_libraries(wili_main fwog_main_bsp)
 # Carries wili_display inside this UF2 (no argument = this folder's display).
 fwog_embed_display_image(wili_main)
 fwog_main_app(wili_main
-    VERSION 008
+    VERSION 009
     DESCRIPTION "Wili main CPU: brings the Wili display firmware up and keeps the watchdog fed")

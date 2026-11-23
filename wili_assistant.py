@@ -54,6 +54,7 @@ import clock
 import status
 import battery
 import motion
+import nap
 import weather
 import wili_board as wb
 
@@ -708,6 +709,8 @@ class Board:
         # board turns the face (firmware 006+).
         self.motion = motion.Motion()
         self.pose = motion.UPRIGHT
+        self.asleep = False          # told to sleep: a triple tap wakes it
+        self._caption = ""
         self.wb.accel_listeners.append(self._on_accel)
 
     TAP_QUIET_AFTER_SPEAKER = 0.4   # the speaker shakes the board as hard as a tap
@@ -718,6 +721,9 @@ class Board:
             for ev in self.motion.feed(t, x, y, z, quiet=quiet):
                 if ev == "double_tap":
                     self.wb.events.put(("press", "tap"))
+                elif ev == "triple_tap":
+                    if self.asleep:
+                        self.wb.events.put(("press", "triple"))
                 elif ev == "rotate":
                     print(f"  (rotated: face turned {90 * self.motion.rotation} degrees)")
                     if self.wb.firmware < 8:
@@ -736,6 +742,12 @@ class Board:
 
     def chime(self, which: int) -> None:
         self.wb.chime(which)
+
+    def caption(self, text: str) -> None:
+        """A line of text under the face, e.g. a sleep countdown (firmware 009+)."""
+        if text != self._caption and self.wb.firmware >= 9:
+            self.wb.caption(text)
+        self._caption = text
 
     def set_volume(self, level: int) -> None:
         self.wb.volume(level)
@@ -968,6 +980,9 @@ class Assistant:
         self._before_mute = int(load_state().get("before_mute", cfg.volume or 7))
         self._mute_after_reply = False
         self._last_said = ""     # what it said last: a question there means listen for the answer
+        # Told to sleep: when to wake (inf = when woken). Kept on the
+        # assistant so a nap carries on if the board drops off USB and back.
+        self._nap_end: float | None = None
         if cfg.volume == 0:
             print("  (starting muted -- say \"unmute\" to hear me)")
         self.alarms = alarms.Alarms(load_state().get("alarms"), lambda items: save_state(alarms=items))
@@ -1075,6 +1090,16 @@ class Assistant:
             "days": {"type": "integer", "minimum": 1, "maximum": 7, "description": "days of forecast"},
         }},
     }}
+    SLEEP_TOOL = {"type": "function", "function": {
+        "name": "go_to_sleep",
+        "description": "Go to sleep (stop listening, the mic off) once you finish this reply, for a "
+                       "while or until a clock time; leave both out to sleep until woken. Alarms "
+                       "and timers still ring; three taps on the board or any button wakes you.",
+        "parameters": {"type": "object", "properties": {
+            "minutes": {"type": "number", "minimum": 0.1, "description": "how long to sleep"},
+            "until": {"type": "string", "description": "or a local clock time to wake at, 24-hour HH:MM"},
+        }},
+    }}
     MAX_TOOL_ROUNDS = 3
     FILLERS = ["Let me look that up.", "One sec, I'll check.", "Let me find out.", "Good question, let me look."]
 
@@ -1140,6 +1165,95 @@ class Assistant:
         name = f"{label} timer" if label else "timer"
         self.speak(f"Okay, {name} for {alarms.say_duration(secs)}, starting now.")
         return True
+
+    # -- sleeping on request --------------------------------------------------
+    def plan_nap(self, seconds: float) -> None:
+        """Sleep once this exchange is over (0 = until woken)."""
+        self._nap_end = time.time() + seconds if seconds > 0 else float("inf")
+
+    def handle_sleep_command(self, text: str) -> bool:
+        """The instant path: "go to sleep for 30 minutes", "take a nap until
+        3 pm", "stop listening" (until woken)."""
+        if not (self.board and self.wake):
+            return False
+        cmd = nap.parse_sleep_command(text)
+        if cmd is None:
+            return False
+        secs, until = cmd
+        print(f"  (sleep command: {nap.say_for(secs, until)})")
+        self.plan_nap(secs)
+        how = f" {nap.say_for(secs, until)}" if secs > 0 else ""
+        self.speak(f"Okay, going to sleep{how}. Tap me three times to wake me.")
+        return True
+
+    def sleep_tool(self, args: dict) -> str:
+        now = time.time()
+        try:
+            if args.get("until"):
+                h, m = (int(x) for x in str(args["until"]).split(":")[:2])
+                if not (0 <= h <= 23 and 0 <= m <= 59):
+                    raise ValueError
+                secs, until = alarms.next_at(f"{h:02d}:{m:02d}", after=now) - now, True
+            elif args.get("minutes"):
+                secs, until = float(args["minutes"]) * 60, False
+            else:
+                secs, until = 0.0, False
+        except (ValueError, TypeError, OverflowError):
+            return "Error: give minutes, or until as HH:MM."
+        secs = min(max(secs, 0.0), nap.MAX_SEC)
+        self.plan_nap(secs)
+        return (f"Done: you will go to sleep {nap.say_for(secs, until)} as soon as you finish this "
+                "reply (no question at the end). Say so briefly, and that three taps or a button wakes you.")
+
+    def nap(self) -> None:
+        """Asleep on request: the mic is off, so noise can't wake it, and the
+        time left shows under the face. Alarms and timers still ring. A triple
+        tap or any button wakes it (a double tap doesn't: too easy to set off)."""
+        b = self.board
+        assert b and self._nap_end is not None
+        left = self._nap_end - time.time()
+        print(f"  (asleep {nap.say_for(left) if left != float('inf') else 'until woken'}: not listening; "
+              "tap three times or press a button to wake)")
+        self.face(wb.SLEEP, force=True)
+        b.presses()
+        why = "time's up"
+        b.asleep = True
+        try:
+            while True:
+                left = self._nap_end - time.time()
+                if left <= 0:
+                    break
+                b.caption("sleeping..." if left == float("inf") else f"sleeping... {nap.countdown(left)}")
+                due = self.alarms.due()
+                if due:
+                    b.caption("")
+                    b.asleep = False
+                    self.guarded(self.ring, due)
+                    b.asleep = True
+                    self.face(wb.SLEEP, force=True)
+                    b.presses()
+                    continue
+                woke = None
+                for press in b.presses():
+                    if press == "tap":
+                        print("  (double tap: still asleep; tap three times to wake)")
+                    else:
+                        woke = "triple tap" if press == "triple" else f"{press} button"
+                if woke:
+                    why = woke
+                    break
+                time.sleep(0.1)
+        finally:
+            b.asleep = False
+            try:
+                b.caption("")
+            except Exception:
+                pass     # the board went away; it clears the caption itself
+        self._nap_end = None
+        print(f"  (awake: {why})")
+        self.face(wb.WAKE, force=True)
+        time.sleep(0.5)
+        self.face(wb.IDLE)
 
     def handle_alarm_command(self, text: str) -> bool:
         """The instant path: "set an alarm for 7 am", "wake me up at 6:30 every
@@ -1439,6 +1553,10 @@ class Assistant:
             system += (f" Your speaker volume is {self.cfg.volume} out of 10; use set_volume when "
                        "asked to change it.")
         tools.append(self.WEATHER_TOOL)
+        if self.board and self.wake:
+            tools.append(self.SLEEP_TOOL)
+            system += (" Use go_to_sleep when asked to sleep, nap or stop listening; tell the user "
+                       "three taps or a button wakes you.")
         home = self.cfg.location or "not set"
         system += (f" For any weather question use get_weather (not web_search); the user's home "
                    f"location is {home}. Speak temperatures as plain numbers, and answer what they "
@@ -1495,12 +1613,16 @@ class Assistant:
         for i, call in enumerate(calls):
             fn = call.get("function") or {}
             timer_names = {t["function"]["name"] for t in self.TIMER_TOOLS}
-            if fn.get("name") not in timer_names | {"set_volume", "get_weather"}:
+            if fn.get("name") not in timer_names | {"set_volume", "get_weather", "go_to_sleep"}:
                 continue
             try:
                 args = json.loads(fn.get("arguments") or "{}")
             except ValueError:
                 args = {}
+            if fn.get("name") == "go_to_sleep":
+                print(f"  (model go_to_sleep: {json.dumps(args)})")
+                results[i] = self.sleep_tool(args)
+                continue
             if fn.get("name") == "get_weather":
                 t = time.time()
                 try:
@@ -1578,7 +1700,8 @@ class Assistant:
     def respond(self, heard: str) -> None:
         print(f"you:  {heard}")
         self._said_slow = False
-        if (self.handle_volume_command(heard) or self.handle_timer_command(heard)
+        if (self.handle_sleep_command(heard)
+                or self.handle_volume_command(heard) or self.handle_timer_command(heard)
                 or self.handle_alarm_command(heard)
                 or self.handle_clock_question(heard) or self.handle_status_question(heard)
                 or self.handle_battery_question(heard) or self.handle_weather_question(heard)):
@@ -1688,7 +1811,7 @@ class Assistant:
         listen for the answer without needing the name or a button."""
         self._last_said = ""
         self.guarded(self.turn, *args)
-        while self.board and asks_question(self._last_said):
+        while self.board and self._nap_end is None and asks_question(self._last_said):
             self._last_said = ""
             samples = self.listen_for_answer()
             if not samples:
@@ -1790,6 +1913,11 @@ class Assistant:
         self.face(wb.IDLE)
         blk = RATE // 10
         while True:
+            if self._nap_end is not None:
+                # Not guarded: if the board drops off USB, the reconnect loop
+                # takes over and the nap carries on once it's back.
+                self.nap()
+                continue
             b.start_stream()
             b.presses()  # drop presses from before we were listening
             noise = 100.0

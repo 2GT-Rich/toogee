@@ -13,6 +13,12 @@ Two things are detected, both tuned on recordings of real handling
   own speaker shakes it as hard as a tap, so impulses are ignored while it's
   playing audio (the caller says when).
 
+* A triple tap: three hits, each within 0.6 s of the one before, after a
+  quiet spell and followed by 0.35 s of nothing, while the board sits still.
+  (TooGee uses it to wake from a nap; a double tap is too easy to set off by
+  bumping the desk.) Three quick taps may also count as a double tap: a
+  hard tap's ringing looks like a third hit, so that's allowed there.
+
 * Its pose, from gravity: standing up (y = -1 g), face down (z = -1 g), on
   its back (z = +1 g) or tilted. A pose counts once it has held for 0.8 s.
 
@@ -50,6 +56,7 @@ class Motion:
     SECOND_MIN = 0.25    # the second hit is at least this fraction of the first
     QUIET_BEFORE = 0.6   # no hit for this long before the first one
     SETTLE = 0.35        # and none for this long after the second
+    TRIPLE_GAP = 0.6     # most time between one hit of a triple tap and the next
     STILL_MG = 120       # tilt change over the last second that still counts as sitting still
     POSE_G = 750         # mg of gravity along an axis to call a pose
     POSE_HOLD = 0.8
@@ -68,6 +75,8 @@ class Motion:
         self._last_peak = 0
         self._cluster_ok = False
         self._pending_double: float | None = None
+        self._taps: list[float] = []         # hits of a triple tap so far
+        self._pending_triple: float | None = None
         self._pose_cand = UPRIGHT
         self._pose_since = 0.0
         self._rot_cand = 0
@@ -91,6 +100,7 @@ class Motion:
 
         if quiet:
             self._imp, self._hits, self._pending_double = None, [], None
+            self._taps, self._pending_triple = [], None
             self._last_hit = t
         elif self._imp is not None:
             self._imp.peak = [max(a, b) for a, b in zip(self._imp.peak, d)]
@@ -106,6 +116,11 @@ class Motion:
         if self._pending_double is not None and t - self._pending_double >= self.SETTLE:
             self._pending_double, self._hits = None, []
             out.append("double_tap")
+        if self._pending_triple is not None and not still:
+            self._pending_triple, self._taps = None, []
+        if self._pending_triple is not None and t - self._pending_triple >= self.SETTLE:
+            self._pending_triple, self._taps = None, []
+            out.append("triple_tap")
 
         pose = self._classify()
         if pose != self._pose_cand:
@@ -133,7 +148,15 @@ class Motion:
         self._last_hit, self._last_peak = t, peak
         if not imp.still:
             self._hits, self._pending_double = [], None
+            self._taps, self._pending_triple = [], None
             return
+        # Triple tap: each hit soon after the one before; the first after a
+        # quiet spell. A fourth is banging, not a triple tap.
+        if self._taps and t - self._taps[-1] <= self.TRIPLE_GAP:
+            self._taps.append(t)
+        else:
+            self._taps = [t] if t - prev_t >= self.QUIET_BEFORE else []
+        self._pending_triple = t if len(self._taps) == 3 else None
         if self._hits and t - self._hits[0][0] <= self.GAP_MAX:
             # Two hits make a double tap; a third that soon is usually a hard
             # tap's ringing, so it's allowed. Any more is banging.
