@@ -15,7 +15,7 @@ import alarms
 MAX_SEC = 24 * 3600
 
 _LEAD = re.compile(
-    r"^(?:(?:hey|ok|okay|so|alright|all right|now|please|toogee|too gee|"
+    r"^(?:(?:hey|ok|okay|so|alright|all right|now|please|toogee|too gee|then|and|and then|after that|also|"
     r"can you|could you|would you|will you|why dont you|go ahead and|you can|"
     r"i want you to|i need you to|id like you to|time to|its time to|you should|just)\s+)*")
 _VERB = re.compile(

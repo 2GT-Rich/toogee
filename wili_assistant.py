@@ -468,6 +468,27 @@ def asks_question(text: str) -> bool:
                for p in parts[-2:])
 
 
+# "Stop", "never mind", "no thanks, that's all": ending the conversation. Only
+# when that's all that was said; "nothing, just saying good morning" still
+# goes to the model.
+_DISMISS = re.compile(
+    r"\b(?:(?:i have|ive got|i got|i ve got) nothing|stop(?: it| that| talking)?|cancel(?: that| it)?|never ?mind|nevermind|forget (?:about )?it|"
+    r"nothing|no|nope|nah|no thanks?|no thank you|not now|thats all|thats it|that will be all|"
+    r"thatll be all|thats enough|enough|im good|im fine|im done|were done|were good|all good|"
+    r"all done|done|go away|shut up|be quiet|quiet|hush|leave it|dont worry(?: about it)?)\b")
+_DISMISS_FILLER = re.compile(
+    r"\b(?:ok|okay|oh|um|uh|hmm|well|actually|just|please|thanks|thank you|toogee|too gee|"
+    r"hey|now|then|for now|really|quite|so|and|yeah|i said|i guess|anymore)\b")
+
+
+def is_dismissal(text: str) -> bool:
+    t = re.sub(r"[^a-z ]+", " ", text.lower().replace("'", "").replace("’", ""))
+    t = re.sub(r"\s+", " ", t).strip()
+    if not t or len(t.split()) > 8 or not _DISMISS.search(t):
+        return False
+    return not _DISMISS_FILLER.sub(" ", _DISMISS.sub(" ", t)).strip()
+
+
 # --------------------------------------------------------------------------- text to speech
 class SayTTS:
     """macOS `say`, rendered straight to the board's format."""
@@ -1186,6 +1207,20 @@ class Assistant:
         self.speak(f"Okay, going to sleep{how}. Tap me three times to wake me.")
         return True
 
+    def _nap_if_asked(self, text: str) -> None:
+        """The model sometimes says "drifting off now" without calling
+        go_to_sleep. If one sentence of the request was a plain "take a nap"
+        ("Cancel that timer. I want you to take a nap."), sleep as asked."""
+        if self._nap_end is not None or not (self.board and self.wake):
+            return
+        for sentence in re.split(r"(?<=[.!?;])\s+", text):
+            cmd = nap.parse_sleep_command(sentence)
+            if cmd:
+                secs, until = cmd
+                print(f"  (the model didn't call go_to_sleep; sleeping as asked: {nap.say_for(secs, until)})")
+                self.plan_nap(secs)
+                return
+
     def sleep_tool(self, args: dict) -> str:
         now = time.time()
         try:
@@ -1254,6 +1289,15 @@ class Assistant:
         self.face(wb.WAKE, force=True)
         time.sleep(0.5)
         self.face(wb.IDLE)
+
+    def handle_dismissal(self, text: str) -> bool:
+        """"Stop", "never mind", "no thanks": just "Okay." and done, instead
+        of the model's "No worries, I'm here if you need anything!"."""
+        if not is_dismissal(text):
+            return False
+        print("  (never mind)")
+        self.speak("Okay.")
+        return True
 
     def handle_alarm_command(self, text: str) -> bool:
         """The instant path: "set an alarm for 7 am", "wake me up at 6:30 every
@@ -1556,7 +1600,8 @@ class Assistant:
         if self.board and self.wake:
             tools.append(self.SLEEP_TOOL)
             system += (" Use go_to_sleep when asked to sleep, nap or stop listening; tell the user "
-                       "three taps or a button wakes you.")
+                       "three taps or a button wakes you. Never say you're going to sleep without "
+                       "calling go_to_sleep: saying it doesn't put you to sleep.")
         home = self.cfg.location or "not set"
         system += (f" For any weather question use get_weather (not web_search); the user's home "
                    f"location is {home}. Speak temperatures as plain numbers, and answer what they "
@@ -1598,6 +1643,7 @@ class Assistant:
             # Still asking for tools after the last round: make it answer.
             msg = self.owui.chat(msgs + [{"role": "user", "content": "Please answer now from what you found."}])
         reply = msg.get("content") or "Sorry, I couldn't find an answer to that."
+        self._nap_if_asked(text)
         # Only the question and the final answer go into the history; the
         # search results would crowd out the conversation.
         self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
@@ -1700,7 +1746,7 @@ class Assistant:
     def respond(self, heard: str) -> None:
         print(f"you:  {heard}")
         self._said_slow = False
-        if (self.handle_sleep_command(heard)
+        if (self.handle_sleep_command(heard) or self.handle_dismissal(heard)
                 or self.handle_volume_command(heard) or self.handle_timer_command(heard)
                 or self.handle_alarm_command(heard)
                 or self.handle_clock_question(heard) or self.handle_status_question(heard)
